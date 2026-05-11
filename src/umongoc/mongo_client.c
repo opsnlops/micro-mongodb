@@ -38,6 +38,13 @@ struct mongo_client {
     char target_host[MONGO_URI_HOST_MAX];
     uint16_t target_port;
 
+    /* Most recent host we successfully reached as the primary. Used as the
+     * first reconnect target so a routine disconnect doesn't pay the SRV
+     * redirect again -- only if Atlas has re-elected does the redirect loop
+     * kick back in. Empty string until the first successful connect. */
+    char last_known_primary[MONGO_URI_HOST_MAX];
+    uint16_t last_known_primary_port;
+
     mongo_transport_t *t;
     bool connected;
 
@@ -226,11 +233,18 @@ static int connect_locked(mongo_client_t *c, uint32_t timeout_ms) {
         }
     }
 
-    /* Reset target to the first SRV host on every fresh connect attempt --
-     * the previous primary may have stepped down. */
-    strncpy(c->target_host, c->uri.hosts[0].host, sizeof c->target_host - 1);
-    c->target_host[sizeof c->target_host - 1] = '\0';
-    c->target_port = c->uri.hosts[0].port;
+    /* Prefer the last-known primary if we have one -- saves the SRV redirect
+     * round-trip on routine reconnects. If the host has since stepped down
+     * the hello check below will redirect us, exactly as on first connect. */
+    if (c->last_known_primary[0]) {
+        strncpy(c->target_host, c->last_known_primary, sizeof c->target_host - 1);
+        c->target_host[sizeof c->target_host - 1] = '\0';
+        c->target_port = c->last_known_primary_port;
+    } else {
+        strncpy(c->target_host, c->uri.hosts[0].host, sizeof c->target_host - 1);
+        c->target_host[sizeof c->target_host - 1] = '\0';
+        c->target_port = c->uri.hosts[0].port;
+    }
 
     int last_rc = MONGO_WIRE_ERR_TRANSPORT;
     for (int attempt = 0; attempt < MAX_REDIRECTS; attempt++) {
@@ -244,6 +258,16 @@ static int connect_locked(mongo_client_t *c, uint32_t timeout_ms) {
         if (rc != MONGO_TRANSPORT_OK) {
             error("[client] connect failed: rc=%d", rc);
             last_rc = rc;
+            /* If we were trying the cached primary, retire it and fall back
+             * to hosts[0] for the next attempt. The cached host might have
+             * been retired or its IP changed; the SRV list is fresher. */
+            if (c->last_known_primary[0] &&
+                strncmp(c->target_host, c->last_known_primary, sizeof c->target_host) == 0) {
+                c->last_known_primary[0] = '\0';
+                strncpy(c->target_host, c->uri.hosts[0].host, sizeof c->target_host - 1);
+                c->target_host[sizeof c->target_host - 1] = '\0';
+                c->target_port = c->uri.hosts[0].port;
+            }
             continue;
         }
 
@@ -305,6 +329,9 @@ static int connect_locked(mongo_client_t *c, uint32_t timeout_ms) {
         bson_destroy(&hello_reply);
         c->connected = true;
         c->consecutive_failures = 0;
+        strncpy(c->last_known_primary, c->target_host, sizeof c->last_known_primary - 1);
+        c->last_known_primary[sizeof c->last_known_primary - 1] = '\0';
+        c->last_known_primary_port = c->target_port;
         info("[client] ready (host=%s:%u)", c->target_host, c->target_port);
         return 0;
     }
