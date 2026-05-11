@@ -14,6 +14,7 @@
 #include "logging.h"
 #include "micro_mongodb.h"
 
+#include "aggregator.h"
 #include "telemetry.h"
 
 #ifndef WIFI_SSID
@@ -68,14 +69,20 @@ static void app_task(void *arg) {
         }
     }
 
-    /* Hand the client to the telemetry task and let it own the demo loop.
-     * Other sample tasks (a temp sensor, etc.) could go alongside it. */
+    /* Two tasks share the same client. The mongo_client_t serializes
+     * network I/O internally, so the telemetry inserts and the aggregator's
+     * reads can interleave safely. */
     TaskHandle_t tel_handle = NULL;
-    BaseType_t ok = xTaskCreate(telemetry_task, "tel", APP_TASK_STACK_WORDS, client, APP_TASK_PRIORITY, &tel_handle);
-    if (ok != pdPASS) {
+    if (xTaskCreate(telemetry_task, "tel", APP_TASK_STACK_WORDS, client, APP_TASK_PRIORITY, &tel_handle) != pdPASS) {
         panic("[app] failed to create telemetry task");
     }
     vTaskCoreAffinitySet(tel_handle, 1 << 0);
+
+    TaskHandle_t agg_handle = NULL;
+    if (xTaskCreate(aggregator_task, "agg", APP_TASK_STACK_WORDS, client, APP_TASK_PRIORITY, &agg_handle) != pdPASS) {
+        panic("[app] failed to create aggregator task");
+    }
+    vTaskCoreAffinitySet(agg_handle, 1 << 0);
 
     /* Nothing else to do; this task can sleep forever. */
     for (;;) {

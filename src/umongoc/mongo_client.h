@@ -11,10 +11,11 @@
  * Lazy-connect: the first CRUD call brings the connection up. On transport
  * errors the client invalidates itself; the next call reconnects automatically.
  *
- * Threading: a single mongo_client_t is owned by exactly one task. Network
- * I/O is serialized inside; the caller does not need a mutex of their own
- * but must not call from multiple tasks concurrently. (Add a wrapping mutex
- * if you need multi-task access.)
+ * Threading: a single mongo_client_t is safe to share across multiple
+ * FreeRTOS tasks. Network operations are serialized internally by a
+ * priority-inheriting mutex; a slow operation in one task blocks others
+ * until it returns. Reconnection is also serialized -- a task that
+ * triggers reconnect holds the mutex across the full TLS+SCRAM cycle.
  */
 
 #pragma once

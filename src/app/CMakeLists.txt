@@ -3,6 +3,7 @@ add_executable(micro_mongodb_app
     freertos_hooks.c
     logger_hook.c
     telemetry.c
+    aggregator.c
 )
 
 target_include_directories(micro_mongodb_app PRIVATE

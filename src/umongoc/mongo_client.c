@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "FreeRTOS.h"
+#include "semphr.h"
 #include "task.h"
 
 #include "logging.h"
@@ -39,6 +40,11 @@ struct mongo_client {
 
     mongo_transport_t *t;
     bool connected;
+
+    /* Serializes network I/O across concurrent callers. Priority-inheriting
+     * so a low-prio task holding it during a TLS handshake doesn't
+     * priority-invert the rest of the system. */
+    SemaphoreHandle_t mutex;
 };
 
 mongo_client_t *mongo_client_new(const mongo_client_config_t *cfg) {
@@ -52,6 +58,12 @@ mongo_client_t *mongo_client_new(const mongo_client_config_t *cfg) {
     }
     memset(c, 0, sizeof *c);
 
+    c->mutex = xSemaphoreCreateMutex();
+    if (!c->mutex) {
+        vPortFree(c);
+        return NULL;
+    }
+
     strncpy(c->mongo_uri_str, cfg->mongo_uri, sizeof c->mongo_uri_str - 1);
     if (cfg->app_name) {
         strncpy(c->app_name, cfg->app_name, sizeof c->app_name - 1);
@@ -63,6 +75,7 @@ mongo_client_t *mongo_client_new(const mongo_client_config_t *cfg) {
     int rc = mongo_uri_parse(c->mongo_uri_str, &c->uri, c->default_timeout_ms);
     if (rc != MONGO_URI_OK) {
         error("[client] uri parse failed: rc=%d for '%s'", rc, c->mongo_uri_str);
+        vSemaphoreDelete(c->mutex);
         vPortFree(c);
         return NULL;
     }
@@ -82,6 +95,9 @@ void mongo_client_free(mongo_client_t *c) {
     }
     if (c->t) {
         mongo_transport_free(c->t);
+    }
+    if (c->mutex) {
+        vSemaphoreDelete(c->mutex);
     }
     vPortFree(c);
 }
@@ -143,10 +159,8 @@ static int rebuild_transport(mongo_client_t *c) {
     return c->t ? 0 : MONGO_WIRE_ERR_ALLOC;
 }
 
-int mongo_client_connect(mongo_client_t *c, uint32_t timeout_ms) {
-    if (!c) {
-        return MONGO_WIRE_ERR_ARGS;
-    }
+/* Assumes c->mutex is held by the caller. */
+static int connect_locked(mongo_client_t *c, uint32_t timeout_ms) {
     if (c->connected) {
         return 0;
     }
@@ -223,8 +237,21 @@ int mongo_client_connect(mongo_client_t *c, uint32_t timeout_ms) {
     return last_rc;
 }
 
+int mongo_client_connect(mongo_client_t *c, uint32_t timeout_ms) {
+    if (!c) {
+        return MONGO_WIRE_ERR_ARGS;
+    }
+    if (xSemaphoreTake(c->mutex, portMAX_DELAY) != pdTRUE) {
+        return MONGO_WIRE_ERR_ARGS;
+    }
+    int rc = connect_locked(c, timeout_ms);
+    xSemaphoreGive(c->mutex);
+    return rc;
+}
+
 /* Invalidate the client connection on any error that means the transport is
- * no longer usable. Next CRUD call will trigger reconnect. */
+ * no longer usable. Next CRUD call will trigger reconnect. Caller must hold
+ * c->mutex. */
 static void mark_disconnected(mongo_client_t *c) {
     c->connected = false;
     if (c->t) {
@@ -232,18 +259,23 @@ static void mark_disconnected(mongo_client_t *c) {
     }
 }
 
-/* Used in CRUD wrappers: ensure we're connected, run `op`, on transport
- * failure invalidate so the next call rebuilds. */
+/* CRUD wrapper: lock, ensure connected, run `op`, invalidate on transport
+ * error, unlock. */
 #define CLIENT_DO(c, timeout_ms, op_call)                                                                              \
     do {                                                                                                               \
-        int _ec = (c)->connected ? 0 : mongo_client_connect((c), (timeout_ms));                                        \
+        if (xSemaphoreTake((c)->mutex, portMAX_DELAY) != pdTRUE) {                                                     \
+            return MONGO_WIRE_ERR_ARGS;                                                                                \
+        }                                                                                                              \
+        int _ec = (c)->connected ? 0 : connect_locked((c), (timeout_ms));                                              \
         if (_ec != 0) {                                                                                                \
+            xSemaphoreGive((c)->mutex);                                                                                \
             return _ec;                                                                                                \
         }                                                                                                              \
         int _rc = (op_call);                                                                                           \
         if (_rc == MONGO_WIRE_ERR_TRANSPORT || _rc == MONGO_WIRE_ERR_ALLOC) {                                          \
             mark_disconnected(c);                                                                                      \
         }                                                                                                              \
+        xSemaphoreGive((c)->mutex);                                                                                    \
         return _rc;                                                                                                    \
     } while (0)
 
