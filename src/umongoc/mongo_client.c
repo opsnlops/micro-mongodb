@@ -300,3 +300,66 @@ int mongo_client_run_command(mongo_client_t *c, const char *db, const bson_t *cm
     }
     CLIENT_DO(c, timeout_ms, mongo_run_command(c->t, db, cmd, reply, timeout_ms));
 }
+
+int mongo_client_ensure_timeseries(mongo_client_t *c, const char *db, const char *coll,
+                                   const mongo_timeseries_opts_t *opts, uint32_t timeout_ms) {
+    if (!c || !db || !coll || !opts || !opts->time_field) {
+        return MONGO_WIRE_ERR_ARGS;
+    }
+    if (timeout_ms == 0) {
+        timeout_ms = c->default_timeout_ms;
+    }
+
+    bson_t cmd;
+    bson_init(&cmd);
+    bson_append_utf8(&cmd, "create", 6, coll, -1);
+
+    bson_t ts;
+    bson_append_document_begin(&cmd, "timeseries", 10, &ts);
+    bson_append_utf8(&ts, "timeField", 9, opts->time_field, -1);
+    if (opts->meta_field && opts->meta_field[0]) {
+        bson_append_utf8(&ts, "metaField", 9, opts->meta_field, -1);
+    }
+    if (opts->granularity && opts->granularity[0]) {
+        bson_append_utf8(&ts, "granularity", 11, opts->granularity, -1);
+    }
+    bson_append_document_end(&cmd, &ts);
+
+    if (opts->expire_after_seconds > 0) {
+        bson_append_int64(&cmd, "expireAfterSeconds", 18, opts->expire_after_seconds);
+    }
+
+    bson_t reply;
+    int rc = mongo_client_run_command(c, db, &cmd, &reply, timeout_ms);
+    bson_destroy(&cmd);
+    if (rc != MONGO_WIRE_OK) {
+        return rc;
+    }
+
+    if (mongo_reply_ok(&reply) >= 1.0) {
+        info("[client] created time-series collection %s.%s (timeField=%s, metaField=%s)", db, coll, opts->time_field,
+             opts->meta_field ? opts->meta_field : "(none)");
+        bson_destroy(&reply);
+        return 0;
+    }
+
+    /* Server rejected. If it's NamespaceExists (48) we treat that as success
+     * -- some other boot created it. If it's anything else, surface the
+     * server's errmsg so the caller can see why. */
+    bson_iter_t it;
+    int code = 0;
+    if (bson_iter_init_find(&it, &reply, "code") && BSON_ITER_HOLDS_INT32(&it)) {
+        code = bson_iter_int32(&it);
+    }
+    if (code == 48 /* NamespaceExists */) {
+        debug("[client] time-series collection %s.%s already exists", db, coll);
+        bson_destroy(&reply);
+        return 0;
+    }
+    warning("[client] could not create time-series collection %s.%s -- if it exists as a regular collection, drop it "
+            "in Atlas and reboot",
+            db, coll);
+    mongo_log_reply_error("create timeseries", &reply);
+    bson_destroy(&reply);
+    return MONGO_WIRE_ERR_PROTOCOL;
+}

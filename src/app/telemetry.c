@@ -1,10 +1,11 @@
 /*
- * telemetry.c — sample task that periodically inserts a record into MongoDB.
+ * telemetry.c — sample task that periodically inserts a record into a
+ * MongoDB time-series collection.
  *
- * Right now it records a pseudo-random value (intended as a placeholder for
- * the real demo, which will read a temperature off an I2C sensor like an
- * MCP9808 / SHT3x / etc.). The shape of the insert document is the same
- * either way; swapping in the sensor read is a one-line change.
+ * Right now it records a pseudo-random value (placeholder for an I2C temp
+ * sensor like MCP9808 / SHT3x / etc.). Swapping in the real sensor is
+ * one line inside the loop; the document shape and time-series setup
+ * stay the same.
  */
 
 #include <stdint.h>
@@ -41,22 +42,42 @@ void telemetry_task(void *arg) {
         return;
     }
 
+    /* Idempotent server-side setup. If the collection already exists as
+     * time-series this is a no-op; if it doesn't exist, the server creates
+     * it with the right schema so future inserts land as time-series buckets
+     * instead of regular documents. */
+    mongo_client_ensure_timeseries(c, TELEMETRY_DB, TELEMETRY_COLL,
+                                   &(mongo_timeseries_opts_t){
+                                       .time_field = "ts",
+                                       .meta_field = "board",
+                                       .granularity = "seconds",
+                                   },
+                                   5000);
+
     for (;;) {
+        if (!mongo_time_is_synced()) {
+            warning("[telemetry] skipping insert -- wall clock not synced yet");
+            vTaskDelay(pdMS_TO_TICKS(TELEMETRY_INTERVAL_MS));
+            continue;
+        }
+
         /* TODO: replace with an I2C sensor read once the hardware is wired up. */
         int32_t sample = (int32_t)(get_rand_32() & 0x3ff); /* 0..1023 */
-        int64_t ts_ms = (int64_t)to_ms_since_boot(get_absolute_time());
+        int64_t ts_ms = mongo_time_now_ms();
 
         bson_t doc;
         bson_init(&doc);
-        BSON_APPEND_INT32(&doc, "value", sample);
-        BSON_APPEND_INT64(&doc, "ts_ms", ts_ms);
+        BSON_APPEND_DATE_TIME(&doc, "ts", ts_ms);
         BSON_APPEND_UTF8(&doc, "board", TELEMETRY_BOARD);
+        BSON_APPEND_INT32(&doc, "value", sample);
 
         bson_t reply;
         int rc = mongo_client_insert(c, TELEMETRY_DB, TELEMETRY_COLL, &doc, &reply, 5000);
         bson_destroy(&doc);
         if (rc == 0) {
-            info("[telemetry] sample=%d ts_ms=%lld", (int)sample, (long long)ts_ms);
+            char ts_iso[32];
+            mongo_time_format_iso8601(ts_iso, sizeof ts_iso);
+            info("[telemetry] sample=%d ts=%s", (int)sample, ts_iso);
             bson_destroy(&reply);
         } else {
             warning("[telemetry] insert failed: rc=%d", rc);

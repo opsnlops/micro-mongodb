@@ -51,7 +51,9 @@ static void app_task(void *arg) {
     if (mongo_time_sync(15000) != 0) {
         warning("[app] continuing without wall-clock time");
     } else {
-        info("[app] wall clock: %lld ms", (long long)mongo_time_now_ms());
+        char ts[32];
+        mongo_time_format_iso8601(ts, sizeof ts);
+        info("[app] wall clock: %s (%lld ms)", ts, (long long)mongo_time_now_ms());
     }
 
     mongo_client_config_t cfg = {

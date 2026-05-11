@@ -80,6 +80,41 @@ int mongo_client_delete(mongo_client_t *c, const char *db, const char *coll, con
  * createIndexes, etc.). */
 int mongo_client_run_command(mongo_client_t *c, const char *db, const bson_t *cmd, bson_t *reply, uint32_t timeout_ms);
 
+/* Options for mongo_client_ensure_timeseries(). */
+typedef struct {
+    /* Required. Name of the field that holds the BSON Date timestamp. */
+    const char *time_field;
+
+    /* Optional. Field that identifies the data source (e.g. "board" or
+     * "sensor_id"). Time-series collections cluster docs by this. */
+    const char *meta_field;
+
+    /* Optional. One of "seconds" / "minutes" / "hours". Defaults to
+     * server's default ("seconds") if NULL. */
+    const char *granularity;
+
+    /* Optional. If non-zero, documents auto-delete after this many seconds.
+     * Useful for capped telemetry. */
+    int64_t expire_after_seconds;
+} mongo_timeseries_opts_t;
+
+/* Idempotently create a time-series collection on the server. If the
+ * collection already exists, returns success without modifying it. If it
+ * exists as a regular (non-time-series) collection, the server still
+ * reports NamespaceExists; in that case you'll need to drop the existing
+ * collection in Atlas first.
+ *
+ * Suggested call at boot:
+ *
+ *     mongo_client_ensure_timeseries(c, "db", "telemetry",
+ *         &(mongo_timeseries_opts_t){
+ *             .time_field = "ts", .meta_field = "board",
+ *             .granularity = "seconds",
+ *         }, 5000);
+ */
+int mongo_client_ensure_timeseries(mongo_client_t *c, const char *db, const char *coll,
+                                   const mongo_timeseries_opts_t *opts, uint32_t timeout_ms);
+
 #ifdef __cplusplus
 }
 #endif

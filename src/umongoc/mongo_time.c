@@ -1,5 +1,7 @@
 #include "mongo_time.h"
 
+#include <time.h>
+
 #include "pico/cyw43_arch.h"
 #include "pico/time.h"
 
@@ -64,3 +66,17 @@ int64_t mongo_time_now_ms(void) {
 }
 
 bool mongo_time_is_synced(void) { return g_time_synced; }
+
+size_t mongo_time_format_iso8601(char *out, size_t sz) {
+    if (!out || sz == 0) {
+        return 0;
+    }
+    if (!g_time_synced) {
+        out[0] = '\0';
+        return 0;
+    }
+    time_t now_sec = (time_t)(mongo_time_now_ms() / 1000);
+    struct tm tm;
+    gmtime_r(&now_sec, &tm);
+    return strftime(out, sz, "%Y-%m-%dT%H:%M:%SZ", &tm);
+}

@@ -14,6 +14,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -32,6 +33,12 @@ int mongo_time_sync(uint32_t timeout_ms);
 int64_t mongo_time_now_ms(void);
 
 bool mongo_time_is_synced(void);
+
+/* Format the current wall clock as ISO 8601 (e.g. "2026-05-11T23:33:35Z").
+ * Writes up to `sz - 1` chars + NUL. Returns the number of bytes written,
+ * or 0 if time hasn't been synced (in which case `out` is set to an empty
+ * string). `sz` should be at least 21 bytes. */
+size_t mongo_time_format_iso8601(char *out, size_t sz);
 
 /* Called by lwIP SNTP via SNTP_SET_SYSTEM_TIME -- not meant for app code. */
 void mongo_time_set_unix_seconds(unsigned int sec);
