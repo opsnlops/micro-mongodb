@@ -17,6 +17,16 @@ TaskHandle_t log_queue_reader_task_handle;
 QueueHandle_t creature_log_message_queue_handle;
 bool volatile logging_queue_exists = false;
 
+/* Are we executing inside an ISR (Cortex-M Handler mode)? The IPSR register
+ * holds the active exception number -- 0 in Thread mode, nonzero in any
+ * Handler mode. Portable across M0+ and M33; FreeRTOS's xPortIsInsideInterrupt
+ * isn't exposed on every port (notably the RP2040 port). */
+static inline bool log_in_isr(void) {
+    uint32_t ipsr;
+    __asm__ volatile("mrs %0, ipsr" : "=r"(ipsr));
+    return ipsr != 0;
+}
+
 // What level of logging we want (this is overridden from the EEPROM if it exists)
 u8 configured_logging_level = DEFAULT_LOGGING_LEVEL;
 
@@ -28,23 +38,38 @@ void logger_init() {
 }
 
 bool inline is_safe_to_log() {
-    return (logging_queue_exists && !xQueueIsQueueFullFromISR(creature_log_message_queue_handle));
+    /* xQueueIsQueueFullFromISR is an ISR-only API; calling it from task
+     * context is documented as undefined. Skip the precheck -- the
+     * xQueueSendToBack call below already handles a full queue gracefully
+     * by returning errQUEUE_FULL (we just drop the log line). */
+    return logging_queue_exists;
 }
 
 /**
  * @brief Internal logging function that handles the common logic for all log levels
+ *
+ * Safe to call from both task and ISR context. We pick the right FreeRTOS
+ * queue API based on `xPortIsInsideInterrupt()` so the same `info()`,
+ * `error()` etc. work from a hardware IRQ handler as well as a regular task.
+ * Either path drops the message on a full queue rather than blocking.
  *
  * @param level The logging level
  * @param message The format string
  * @param args Variable arguments for the format string
  */
 static void log_internal(uint8_t level, const char *message, va_list args) {
-    // If not at the right logging level or queue is full, stop now
     if (configured_logging_level < level || !is_safe_to_log())
         return;
 
     struct LogMessage lm = createMessageObject(level, message, args);
-    xQueueSendToBackFromISR(creature_log_message_queue_handle, &lm, NULL);
+
+    if (log_in_isr()) {
+        BaseType_t hp_woken = pdFALSE;
+        (void)xQueueSendToBackFromISR(creature_log_message_queue_handle, &lm, &hp_woken);
+        portYIELD_FROM_ISR(hp_woken);
+    } else {
+        (void)xQueueSendToBack(creature_log_message_queue_handle, &lm, 0);
+    }
 }
 
 void __unused verbose(const char *message, ...) {

@@ -160,9 +160,7 @@ static void udp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip
     }
     ctx->reply_len = copied;
     ctx->ok = true;
-    BaseType_t hp_woken = pdFALSE;
-    xSemaphoreGiveFromISR(ctx->sem, &hp_woken);
-    portYIELD_FROM_ISR(hp_woken);
+    xSemaphoreGive(ctx->sem);
 }
 
 /* Build, send, and receive a DNS query of `qtype`. On success, the raw reply

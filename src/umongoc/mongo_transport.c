@@ -52,6 +52,11 @@ struct mongo_transport {
 
 /* ---------------- lwIP callbacks (tcpip thread context) ---------------- */
 
+/* These callbacks fire on the lwIP tcpip thread, which is a regular FreeRTOS
+ * task -- NOT an ISR. So use the plain xSemaphoreGive (not _FromISR). The
+ * FromISR variants worked accidentally on this build but break on SMP and
+ * tickless-idle configurations. */
+
 static err_t cb_connected(void *arg, struct altcp_pcb *pcb, err_t err) {
     (void)pcb;
     mongo_transport_t *t = arg;
@@ -61,9 +66,7 @@ static err_t cb_connected(void *arg, struct altcp_pcb *pcb, err_t err) {
     } else {
         t->state = XPORT_CONNECTED;
     }
-    BaseType_t hp_woken = pdFALSE;
-    xSemaphoreGiveFromISR(t->connect_sem, &hp_woken);
-    portYIELD_FROM_ISR(hp_woken);
+    xSemaphoreGive(t->connect_sem);
     return ERR_OK;
 }
 
@@ -87,9 +90,7 @@ static err_t cb_recv(void *arg, struct altcp_pcb *pcb, struct pbuf *p, err_t err
             pbuf_cat(t->rx_head, p);
         }
     }
-    BaseType_t hp_woken = pdFALSE;
-    xSemaphoreGiveFromISR(t->recv_sem, &hp_woken);
-    portYIELD_FROM_ISR(hp_woken);
+    xSemaphoreGive(t->recv_sem);
     return ERR_OK;
 }
 
@@ -102,10 +103,8 @@ static void cb_err(void *arg, err_t err) {
     t->last_err = err;
     /* lwIP has already deallocated the pcb when err callback fires. */
     t->pcb = NULL;
-    BaseType_t hp_woken = pdFALSE;
-    xSemaphoreGiveFromISR(t->connect_sem, &hp_woken);
-    xSemaphoreGiveFromISR(t->recv_sem, &hp_woken);
-    portYIELD_FROM_ISR(hp_woken);
+    xSemaphoreGive(t->connect_sem);
+    xSemaphoreGive(t->recv_sem);
 }
 
 /* DNS resolution helper. lwIP's resolver is callback-style; we synthesize a
@@ -125,9 +124,8 @@ static void cb_dns(const char *name, const ip_addr_t *addr, void *arg) {
     } else {
         ctx->ok = false;
     }
-    BaseType_t hp_woken = pdFALSE;
-    xSemaphoreGiveFromISR(ctx->sem, &hp_woken);
-    portYIELD_FROM_ISR(hp_woken);
+    /* Fires on tcpip_thread (task), not from an ISR. */
+    xSemaphoreGive(ctx->sem);
 }
 
 static int resolve_host(const char *host, ip_addr_t *out, uint32_t timeout_ms) {
@@ -387,8 +385,16 @@ int mongo_transport_recv_exact(mongo_transport_t *t, uint8_t *buf, size_t want, 
                 t->rx_offset = 0;
             }
         }
+        /* altcp_recved takes a uint16_t window-credit. Chunk so we don't
+         * silently truncate when a single drain pass consumes more than
+         * 64 KB (the cursor batch path can hit this on big find results). */
         if (drained_this_pass > 0 && t->pcb) {
-            altcp_recved(t->pcb, (uint16_t)drained_this_pass);
+            size_t remaining = drained_this_pass;
+            while (remaining > 0) {
+                uint16_t chunk = remaining > UINT16_MAX ? UINT16_MAX : (uint16_t)remaining;
+                altcp_recved(t->pcb, chunk);
+                remaining -= chunk;
+            }
         }
         cyw43_arch_lwip_end();
 

@@ -10,6 +10,7 @@
 #include "mbedtls/md.h"
 #include "mbedtls/md5.h"
 #include "mbedtls/pkcs5.h"
+#include "mbedtls/platform_util.h"
 #include "mbedtls/sha1.h"
 #include "mbedtls/sha256.h"
 
@@ -46,6 +47,11 @@ static void hexify(const uint8_t *bytes, size_t n, char *out, size_t out_sz) {
 #define SCRAM_NONCE_B64 ((SCRAM_NONCE_RAW + 2) / 3 * 4 + 1)
 #define SCRAM_MAX_KEY_LEN 32 /* SHA-256 output; SHA-1 only needs 20 */
 #define SCRAM_MIN_ITERATIONS 4096
+/* Hard ceiling to bound PBKDF2 CPU cost. A hostile server (or anyone past
+ * the TLS endpoint) can otherwise request 2^31 iterations and peg the Pico
+ * for days. 600000 covers Atlas's default (10000-15000) and any realistic
+ * future hardening. */
+#define SCRAM_MAX_ITERATIONS 600000
 #define SCRAM_AUTH_MSG_MAX 1024
 #define SCRAM_FIELD_MAX 256
 #define SCRAM_GS2_HEADER "n,,"
@@ -395,8 +401,9 @@ static int scram_auth_run(mongo_transport_t *t, const scram_mech_t *mech, const 
         return MONGO_AUTH_ERR_NONCE_MISMATCH;
     }
     long iterations = strtol(iter_str, NULL, 10);
-    if (iterations < SCRAM_MIN_ITERATIONS) {
-        error("[auth] server iteration count %ld below SCRAM floor", iterations);
+    if (iterations < SCRAM_MIN_ITERATIONS || iterations > SCRAM_MAX_ITERATIONS) {
+        error("[auth] server iteration count %ld out of bounds [%d, %d]", iterations, SCRAM_MIN_ITERATIONS,
+              SCRAM_MAX_ITERATIONS);
         return MONGO_AUTH_ERR_PROTOCOL;
     }
 
@@ -587,6 +594,20 @@ static int scram_auth_run(mongo_transport_t *t, const scram_mech_t *mech, const 
         }
     }
 
+    /* Defense-in-depth: wipe SCRAM intermediates before returning so a
+     * future memory-disclosure bug or core dump can't read salted_password
+     * (which is password-equivalent for PBKDF2 brute force) or the derived
+     * keys. Error paths after PBKDF2 still leak; see security review H5.
+     * mbedtls_platform_zeroize won't be elided by the optimizer. */
+    mbedtls_platform_zeroize(prepped_pw, sizeof prepped_pw);
+    mbedtls_platform_zeroize(nonce_raw, sizeof nonce_raw);
+    mbedtls_platform_zeroize(salted_password, sizeof salted_password);
+    mbedtls_platform_zeroize(client_key, sizeof client_key);
+    mbedtls_platform_zeroize(stored_key, sizeof stored_key);
+    mbedtls_platform_zeroize(server_key, sizeof server_key);
+    mbedtls_platform_zeroize(client_signature, sizeof client_signature);
+    mbedtls_platform_zeroize(client_proof, sizeof client_proof);
+    mbedtls_platform_zeroize(expected_sig, sizeof expected_sig);
     return MONGO_AUTH_OK;
 }
 
