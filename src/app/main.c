@@ -47,6 +47,18 @@
 #define TEST_COLL "pico"
 #define CMD_TIMEOUT_MS 5000
 
+#if PICO_PLATFORM_IS_RP2350
+#define BOARD_NAME "pico2_w"
+#else
+#define BOARD_NAME "pico_w"
+#endif
+
+/* Microsecond timer: useful for the Pico W vs Pico 2 W perf comparison.
+ * absolute_time_diff_us returns int64 but for our sub-second ops it fits an
+ * int comfortably. */
+#define TIMED_BEGIN(name) absolute_time_t _t_##name = get_absolute_time()
+#define TIMED_US(name) ((int)absolute_time_diff_us(_t_##name, get_absolute_time()))
+
 /* Pull a numeric `ok` from a reply doc. Server returns 1.0 or 1, depending. */
 static double reply_ok(const bson_t *reply) {
     bson_iter_t it;
@@ -56,25 +68,30 @@ static double reply_ok(const bson_t *reply) {
     return 0.0;
 }
 
-static int run_ping(mongo_transport_t *t) {
+static int run_ping(mongo_transport_t *t, int *us_out) {
     bson_t cmd;
     bson_init(&cmd);
     BSON_APPEND_INT32(&cmd, "ping", 1);
 
+    TIMED_BEGIN(ping);
     bson_t reply;
     int rc = mongo_run_command(t, "admin", &cmd, &reply, CMD_TIMEOUT_MS);
+    *us_out = TIMED_US(ping);
     bson_destroy(&cmd);
     if (rc != MONGO_WIRE_OK) {
         error("ping: rc=%d", rc);
         return rc;
     }
-    info("ping ok=%.0f", reply_ok(&reply));
+    info("ping ok=%.0f (%d us)", reply_ok(&reply), *us_out);
     bson_destroy(&reply);
     return MONGO_WIRE_OK;
 }
 
 static int run_smoke_test(mongo_transport_t *t) {
-    int rc = run_ping(t);
+    TIMED_BEGIN(total);
+    int t_ping = 0, t_insert = 0, t_find = 0, t_update = 0, t_delete = 0;
+
+    int rc = run_ping(t, &t_ping);
     if (rc != MONGO_WIRE_OK) {
         return rc;
     }
@@ -87,10 +104,12 @@ static int run_smoke_test(mongo_transport_t *t) {
     bson_t doc;
     bson_init(&doc);
     BSON_APPEND_INT64(&doc, "pico_tag", tag);
-    BSON_APPEND_UTF8(&doc, "board", "pico2w");
+    BSON_APPEND_UTF8(&doc, "board", BOARD_NAME);
 
     bson_t reply;
+    TIMED_BEGIN(insert);
     rc = mongo_insert_one(t, TEST_DB, TEST_COLL, &doc, &reply, CMD_TIMEOUT_MS);
+    t_insert = TIMED_US(insert);
     bson_destroy(&doc);
     if (rc != MONGO_WIRE_OK || reply_ok(&reply) < 1.0) {
         error("insert: rc=%d ok=%.0f", rc, reply_ok(&reply));
@@ -98,18 +117,20 @@ static int run_smoke_test(mongo_transport_t *t) {
         return rc != MONGO_WIRE_OK ? rc : MONGO_WIRE_ERR_PROTOCOL;
     }
     bson_destroy(&reply);
-    info("insert ok tag=%lld", (long long)tag);
+    info("insert ok tag=%lld (%d us)", (long long)tag, t_insert);
 
     /* --- find with cursor --- */
     bson_t filter;
     bson_init(&filter);
-    BSON_APPEND_UTF8(&filter, "board", "pico2w");
+    BSON_APPEND_UTF8(&filter, "board", BOARD_NAME);
 
     mongo_cursor_t *cur = NULL;
+    TIMED_BEGIN(find);
     rc = mongo_find(t, TEST_DB, TEST_COLL, &filter, 5, &cur, CMD_TIMEOUT_MS);
     bson_destroy(&filter);
     if (rc != MONGO_WIRE_OK) {
-        error("find: rc=%d", rc);
+        t_find = TIMED_US(find);
+        error("find: rc=%d (%d us)", rc, t_find);
         return rc;
     }
 
@@ -121,7 +142,8 @@ static int run_smoke_test(mongo_transport_t *t) {
             debug("  doc pico_tag=%lld", (long long)bson_iter_int64(&it));
         }
     }
-    info("find iterated %u docs", (unsigned)mongo_cursor_total_seen(cur));
+    t_find = TIMED_US(find);
+    info("find iterated %u docs (%d us)", (unsigned)mongo_cursor_total_seen(cur), t_find);
     int cursor_status = n; /* 0 = exhausted, negative = error */
     mongo_cursor_destroy(cur);
     if (cursor_status < 0) {
@@ -141,7 +163,9 @@ static int run_smoke_test(mongo_transport_t *t) {
     BSON_APPEND_BOOL(&set, "seen", true);
     bson_append_document_end(&up_spec, &set);
 
+    TIMED_BEGIN(update);
     rc = mongo_update_one(t, TEST_DB, TEST_COLL, &up_filter, &up_spec, false, &reply, CMD_TIMEOUT_MS);
+    t_update = TIMED_US(update);
     bson_destroy(&up_filter);
     bson_destroy(&up_spec);
     if (rc != MONGO_WIRE_OK || reply_ok(&reply) < 1.0) {
@@ -150,14 +174,16 @@ static int run_smoke_test(mongo_transport_t *t) {
         return rc != MONGO_WIRE_OK ? rc : MONGO_WIRE_ERR_PROTOCOL;
     }
     bson_destroy(&reply);
-    info("update ok");
+    info("update ok (%d us)", t_update);
 
     /* --- delete (cleanup) --- */
     bson_t del_filter;
     bson_init(&del_filter);
     BSON_APPEND_INT64(&del_filter, "pico_tag", tag);
 
+    TIMED_BEGIN(del);
     rc = mongo_delete_one(t, TEST_DB, TEST_COLL, &del_filter, &reply, CMD_TIMEOUT_MS);
+    t_delete = TIMED_US(del);
     bson_destroy(&del_filter);
     if (rc != MONGO_WIRE_OK || reply_ok(&reply) < 1.0) {
         error("delete: rc=%d ok=%.0f", rc, reply_ok(&reply));
@@ -165,8 +191,10 @@ static int run_smoke_test(mongo_transport_t *t) {
         return rc != MONGO_WIRE_OK ? rc : MONGO_WIRE_ERR_PROTOCOL;
     }
     bson_destroy(&reply);
-    info("delete ok");
+    info("delete ok (%d us)", t_delete);
 
+    info("perf [%s]: ping=%d insert=%d find=%d update=%d delete=%d total=%d us", BOARD_NAME, t_ping, t_insert, t_find,
+         t_update, t_delete, TIMED_US(total));
     return MONGO_WIRE_OK;
 }
 
@@ -225,13 +253,15 @@ static void network_task(void *arg) {
 
     for (;;) {
         info("opening tcp connection to %s:%u ...", target_host, target_port);
+        TIMED_BEGIN(connect);
         rc = mongo_transport_connect(t, target_host, target_port, 5000);
+        int t_connect = TIMED_US(connect);
         if (rc != MONGO_TRANSPORT_OK) {
-            error("connect failed: rc=%d (lwip err=%d)", rc, mongo_transport_last_err(t));
+            error("connect failed: rc=%d (lwip err=%d) after %d us", rc, mongo_transport_last_err(t), t_connect);
             vTaskDelay(pdMS_TO_TICKS(5000));
             continue;
         }
-        info("connected, running smoke test");
+        info("connected (%d us), running smoke test", t_connect);
         rc = run_smoke_test(t);
         if (rc == MONGO_WIRE_OK) {
             info("smoke test passed");
@@ -251,7 +281,7 @@ int main(void) {
     sleep_ms(2000);
 
     logger_init();
-    info("=== micro-mongodb boot ===");
+    info("=== micro-mongodb boot (board=%s) ===", BOARD_NAME);
 
     TaskHandle_t net_handle = NULL;
     BaseType_t ok =
