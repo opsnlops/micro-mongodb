@@ -101,7 +101,10 @@ static void build_aggregate_cmd(bson_t *cmd, int32_t window) {
 }
 
 /* Pull cursor.firstBatch[0] from an aggregate reply and read out the
- * stats fields. Returns true if a result row was found. */
+ * stats fields. Returns true only when at least the `n` field was present
+ * -- without n the pipeline didn't produce a row, and the other stats
+ * (avg/min/max) would be left at their input defaults, which would look
+ * like "everything is 0" rather than "no data." */
 static bool parse_aggregate_result(const bson_t *reply, double *avg, int32_t *n, int32_t *min_v, int32_t *max_v) {
     bson_iter_t it;
     if (!bson_iter_init_find(&it, reply, "cursor") || !BSON_ITER_HOLDS_DOCUMENT(&it)) {
@@ -111,18 +114,15 @@ static bool parse_aggregate_result(const bson_t *reply, double *avg, int32_t *n,
     if (!bson_iter_recurse(&it, &cursor_it)) {
         return false;
     }
+    /* bson_iter_init_find restarts at the document's first key, which is
+     * what we want -- the previous hand-rolled loop happened to be O(1)
+     * because firstBatch is the second key, but a server reply with extra
+     * fields would have left it pointing at the wrong key. */
     bson_iter_t batch_it;
-    bool got_batch = false;
-    while (bson_iter_next(&cursor_it)) {
-        if (strcmp(bson_iter_key(&cursor_it), "firstBatch") == 0 && BSON_ITER_HOLDS_ARRAY(&cursor_it)) {
-            batch_it = cursor_it;
-            got_batch = true;
-            break;
-        }
-    }
-    if (!got_batch) {
+    if (!bson_iter_find(&cursor_it, "firstBatch") || !BSON_ITER_HOLDS_ARRAY(&cursor_it)) {
         return false;
     }
+    batch_it = cursor_it;
     bson_iter_t arr_it;
     if (!bson_iter_recurse(&batch_it, &arr_it) || !bson_iter_next(&arr_it) || !BSON_ITER_HOLDS_DOCUMENT(&arr_it)) {
         return false;
@@ -137,11 +137,14 @@ static bool parse_aggregate_result(const bson_t *reply, double *avg, int32_t *n,
     }
 
     bson_iter_t r_it;
+    /* n is mandatory; if it's missing the result row is unusable. */
+    if (!bson_iter_init_find(&r_it, &doc, "n") || !BSON_ITER_HOLDS_NUMBER(&r_it)) {
+        return false;
+    }
+    *n = (int32_t)bson_iter_as_int64(&r_it);
+
     if (bson_iter_init_find(&r_it, &doc, "avg") && BSON_ITER_HOLDS_NUMBER(&r_it)) {
         *avg = bson_iter_as_double(&r_it);
-    }
-    if (bson_iter_init_find(&r_it, &doc, "n") && BSON_ITER_HOLDS_NUMBER(&r_it)) {
-        *n = (int32_t)bson_iter_as_int64(&r_it);
     }
     if (bson_iter_init_find(&r_it, &doc, "min") && BSON_ITER_HOLDS_NUMBER(&r_it)) {
         *min_v = (int32_t)bson_iter_as_int64(&r_it);

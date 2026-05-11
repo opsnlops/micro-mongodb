@@ -236,10 +236,17 @@ int mongo_handshake(mongo_transport_t *t, const char *app_name, const char *boar
 }
 
 /* Pull a string field out of "k=v,k=v,..." style payloads. Returns the
- * value length and copies into `out` (NUL-terminated). */
+ * value length and copies into `out` (NUL-terminated).
+ *
+ * The loop always anchors `p` at a field-start: it begins at payload[0] and,
+ * on each miss, jumps to one past the next comma. That keeps an embedded
+ * `<key>=` substring inside a value (theoretically possible in a base64
+ * blob's last byte plus a stray `=` padding char) from being misread as the
+ * start of a new field. */
 static int extract_field(const char *payload, char key, char *out, size_t out_sz) {
     const char *p = payload;
     while (*p) {
+        /* p always points at a field-start here. */
         if (p[0] == key && p[1] == '=') {
             const char *value = p + 2;
             const char *end = strchr(value, ',');
