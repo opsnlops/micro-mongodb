@@ -22,7 +22,24 @@ static volatile bool g_time_synced = false;
 static volatile int64_t g_boot_offset_ms = 0;
 static SemaphoreHandle_t g_sync_sem = NULL;
 
+/* Sanity bounds on what we'll accept from an NTP server. A hostile resolver
+ * (or a misconfigured NTP server) could otherwise roll the clock back to 1970
+ * -- which would make every cert appear "not yet valid" or, worse, "still
+ * valid" for certs that have since expired. The lower bound is the date this
+ * project was started; the upper bound is far enough out that legitimate
+ * time on this firmware should always fall inside it. */
+#define MONGO_TIME_MIN_UNIX_SEC 1577836800u /* 2020-01-01 UTC */
+#define MONGO_TIME_MAX_UNIX_SEC 4102444800u /* 2100-01-01 UTC */
+
 void mongo_time_set_unix_seconds(unsigned int sec) {
+    if (sec < MONGO_TIME_MIN_UNIX_SEC || sec > MONGO_TIME_MAX_UNIX_SEC) {
+        warning("[time] rejecting out-of-range SNTP reply: %u (must be in [%u, %u])", sec, MONGO_TIME_MIN_UNIX_SEC,
+                MONGO_TIME_MAX_UNIX_SEC);
+        /* Don't signal -- the waiter loops on g_time_synced, so dropping the
+         * reply silently here lets lwIP's next scheduled SNTP poll deliver a
+         * (hopefully better) value while the caller keeps waiting. */
+        return;
+    }
     int64_t now_boot_ms = (int64_t)to_ms_since_boot(get_absolute_time());
     int64_t new_offset = (int64_t)sec * 1000 - now_boot_ms;
     /* int64_t writes are non-atomic on a 32-bit ARM core. The read path
@@ -58,8 +75,12 @@ int mongo_time_sync(uint32_t timeout_ms) {
     sntp_init();
     cyw43_arch_lwip_end();
 
+    /* Wait for the overall budget. lwIP's SNTP module re-issues queries on
+     * its own poll schedule, so a transient packet loss is absorbed silently
+     * -- we just sit on the semaphore until either a usable reply lands or
+     * the total timeout elapses. */
     if (xSemaphoreTake(g_sync_sem, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
-        error("[time] SNTP sync timeout after %lu ms (no reply from %s)", (unsigned long)timeout_ms, NTP_SERVER);
+        error("[time] SNTP sync timeout after %lu ms (no usable reply from %s)", (unsigned long)timeout_ms, NTP_SERVER);
         return -2;
     }
     return 0;
