@@ -258,6 +258,20 @@ static int extract_field(const char *payload, char key, char *out, size_t out_sz
     return -1;
 }
 
+/* Constant-time memory compare. We use this to validate the server's SCRAM
+ * signature: a non-constant-time memcmp can leak information about
+ * `expected_sig` (derived from the password) via reply timing measurable
+ * by a hostile or curious server. Returns 0 if equal, non-zero otherwise. */
+static int ct_memcmp(const void *a, const void *b, size_t n) {
+    const uint8_t *x = (const uint8_t *)a;
+    const uint8_t *y = (const uint8_t *)b;
+    uint8_t diff = 0;
+    for (size_t i = 0; i < n; i++) {
+        diff |= (uint8_t)(x[i] ^ y[i]);
+    }
+    return diff;
+}
+
 /* One-shot HMAC using the mechanism's hash. */
 static int hmac_digest(mbedtls_md_type_t md_type, const uint8_t *key, size_t key_len, const uint8_t *msg,
                        size_t msg_len, uint8_t *out) {
@@ -385,6 +399,15 @@ static int scram_auth_run(mongo_transport_t *t, const scram_mech_t *mech, const 
     memcpy(server_first, bin_data, bin_len);
     server_first[bin_len] = '\0';
     bson_destroy(&reply);
+
+    /* RFC 5802 §5.1 reserved-mext: clients that don't understand a leading
+     * "m=" attribute MUST treat it as a fatal error. We don't implement any
+     * extensions, so reject up front. (MongoDB's server doesn't send
+     * reserved-mext, but a malicious MITM could.) */
+    if (server_first[0] == 'm' && server_first[1] == '=') {
+        error("[auth] server sent reserved-mext extension which this client does not implement");
+        return MONGO_AUTH_ERR_PROTOCOL;
+    }
 
     /* ---- server-first parse: r=<nonce>, s=<base64 salt>, i=<iterations> ---- */
     char server_nonce[SCRAM_FIELD_MAX];
@@ -575,7 +598,10 @@ static int scram_auth_run(mongo_transport_t *t, const scram_mech_t *mech, const 
                               strlen(server_final + 2)) != 0) {
         return MONGO_AUTH_ERR_PROTOCOL;
     }
-    if (actual_sig_len != mech->key_len || memcmp(actual_sig, expected_sig, mech->key_len) != 0) {
+    /* Constant-time so a hostile server can't probe our timing for info
+     * about `expected_sig` (which is HMAC(server_key, auth_message), and
+     * server_key is password-derived). */
+    if (actual_sig_len != mech->key_len || ct_memcmp(actual_sig, expected_sig, mech->key_len) != 0) {
         error("[auth] server signature mismatch");
         return MONGO_AUTH_ERR_SERVER_SIG;
     }

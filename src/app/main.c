@@ -354,6 +354,15 @@ static void network_task(void *arg) {
          * SHA-1 based on the hello reply's saslSupportedMechs. */
         int t_scram = 0;
         if (uri.username[0] && uri.password[0]) {
+            if (!uri.tls) {
+                /* SCRAM doesn't reveal the password, but the saslSupportedMechs
+                 * list itself is unauthenticated on a plain connection -- an
+                 * attacker could strip SCRAM-SHA-256 from it to force a SHA-1
+                 * downgrade as a stepping stone to other attacks. The proof
+                 * also travels in the clear and is offline-brute-forceable. */
+                warning("[net] SCRAM over plain TCP -- saslSupportedMechs is unauthenticated, proofs are "
+                        "offline-attackable");
+            }
             TIMED_BEGIN(scram);
             int arc = mongo_authenticate(t, &hello_reply, uri.auth_source, uri.username, uri.password, CMD_TIMEOUT_MS);
             t_scram = TIMED_US(scram);

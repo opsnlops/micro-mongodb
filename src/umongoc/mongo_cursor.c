@@ -176,6 +176,13 @@ int mongo_cursor_next(mongo_cursor_t *c, const bson_t **out_doc, uint32_t timeou
             if (!bson_init_static(&c->current_doc, doc_data, doc_len)) {
                 return MONGO_WIRE_ERR_PROTOCOL;
             }
+            /* Each batch element is server-controlled; validate its structure
+             * before handing the borrowed bson_t off to the caller. */
+            size_t bad_off = 0;
+            if (!bson_validate(&c->current_doc, BSON_VALIDATE_NONE, &bad_off)) {
+                error("[cursor] malformed BSON in batch element at offset %u", (unsigned)bad_off);
+                return MONGO_WIRE_ERR_PROTOCOL;
+            }
             c->current_doc_init = true;
             c->total_seen++;
             *out_doc = &c->current_doc;

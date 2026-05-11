@@ -236,6 +236,16 @@ int mongo_uri_parse(const char *uri_str, mongo_uri_t *out, uint32_t dns_timeout_
     }
 
     if (out->is_srv) {
+        /* Trust boundary note: the SRV and TXT responses here come back over
+         * unauthenticated plain UDP DNS. A network attacker who can spoof
+         * DNS replies can change `replicaSet` and `authSource` (and thus
+         * which database we send SCRAM proofs to). The TLS handshake to the
+         * server still validates the cert chain via SNI / hostname, which
+         * limits where the connection actually lands. If your deployment's
+         * threat model includes hostile DNS, use trusted resolvers (DoT/DoH
+         * at the network level) or pin to a `mongodb://host1,host2,...`
+         * URI with explicit hosts instead of `mongodb+srv://`. */
+
         /* Stash the seed host before we replace it with SRV-resolved targets;
          * the TXT lookup uses the original seed name. */
         char seed[MONGO_URI_HOST_MAX];

@@ -139,6 +139,16 @@ static int recv_op_msg(mongo_transport_t *t, uint32_t expected_response_to, bson
                 vPortFree(payload);
                 return MONGO_WIRE_ERR_PROTOCOL;
             }
+            /* The outer size check above only validates the OUTER length;
+             * libbson's iterator will happily walk past nested malformed
+             * length fields. Validate the full structure before letting
+             * libbson (or callers) traverse it. */
+            size_t bad_off = 0;
+            if (!bson_validate(&src, BSON_VALIDATE_NONE, &bad_off)) {
+                error("[wire] malformed BSON in reply at offset %u", (unsigned)bad_off);
+                vPortFree(payload);
+                return MONGO_WIRE_ERR_PROTOCOL;
+            }
             bson_copy_to(&src, reply_out);
             vPortFree(payload);
             return MONGO_WIRE_OK;
