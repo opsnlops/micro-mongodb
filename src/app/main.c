@@ -274,10 +274,17 @@ static void network_task(void *arg) {
         }
         info("connected (%d us, %s)", t_connect, uri.tls ? "TLS" : "plain");
 
-        /* hello handshake */
+        /* hello handshake. If we have credentials, ask the server which
+         * mechanisms are actually enabled for this specific user. */
+        char sasl_user_db[160] = {0};
+        const char *sasl_user_db_arg = NULL;
+        if (uri.username[0]) {
+            snprintf(sasl_user_db, sizeof sasl_user_db, "%s.%s", uri.auth_source, uri.username);
+            sasl_user_db_arg = sasl_user_db;
+        }
         TIMED_BEGIN(hello);
         bson_t hello_reply;
-        int hrc = mongo_handshake(t, "micro-mongodb-demo", BOARD_NAME, &hello_reply, CMD_TIMEOUT_MS);
+        int hrc = mongo_handshake(t, "micro-mongodb-demo", BOARD_NAME, sasl_user_db_arg, &hello_reply, CMD_TIMEOUT_MS);
         int t_hello = TIMED_US(hello);
         if (hrc != MONGO_AUTH_OK) {
             error("hello failed: %s (rc=%d, %d us)", mongo_auth_status_str(hrc), hrc, t_hello);

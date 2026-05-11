@@ -107,8 +107,8 @@ static void log_server_rejection(const char *phase, const bson_t *reply) {
     }
 }
 
-int mongo_handshake(mongo_transport_t *t, const char *app_name, const char *board_name, bson_t *reply_out,
-                    uint32_t timeout_ms) {
+int mongo_handshake(mongo_transport_t *t, const char *app_name, const char *board_name, const char *sasl_user_db,
+                    bson_t *reply_out, uint32_t timeout_ms) {
     if (!t || !reply_out) {
         return MONGO_AUTH_ERR_ARGS;
     }
@@ -144,6 +144,10 @@ int mongo_handshake(mongo_transport_t *t, const char *app_name, const char *boar
 
     bson_append_document_end(&cmd, &client);
 
+    if (sasl_user_db) {
+        BSON_APPEND_UTF8(&cmd, "saslSupportedMechs", sasl_user_db);
+    }
+
     int rc = mongo_run_command(t, "admin", &cmd, reply_out, timeout_ms);
     bson_destroy(&cmd);
     if (rc != MONGO_WIRE_OK) {
@@ -154,6 +158,26 @@ int mongo_handshake(mongo_transport_t *t, const char *app_name, const char *boar
         log_server_rejection("hello", reply_out);
         bson_destroy(reply_out);
         return MONGO_AUTH_ERR_SERVER_REJECTED;
+    }
+
+    /* Surface the saslSupportedMechs the server reported -- this tells us
+     * directly which auth mechanisms are configured for this specific user. */
+    bson_iter_t it;
+    if (sasl_user_db && bson_iter_init_find(&it, reply_out, "saslSupportedMechs") && BSON_ITER_HOLDS_ARRAY(&it)) {
+        bson_iter_t arr;
+        if (bson_iter_recurse(&it, &arr)) {
+            char buf[128] = {0};
+            size_t pos = 0;
+            while (bson_iter_next(&arr) && BSON_ITER_HOLDS_UTF8(&arr)) {
+                const char *m = bson_iter_utf8(&arr, NULL);
+                int n = snprintf(buf + pos, sizeof buf - pos, "%s%s", pos ? "," : "", m);
+                if (n < 0 || (size_t)n >= sizeof buf - pos) {
+                    break;
+                }
+                pos += (size_t)n;
+            }
+            info("[auth] saslSupportedMechs for %s: [%s]", sasl_user_db, buf);
+        }
     }
     return MONGO_AUTH_OK;
 }

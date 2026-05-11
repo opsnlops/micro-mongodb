@@ -47,9 +47,15 @@ const char *mongo_auth_status_str(int status);
 
 /* Run the {hello: 1, client: {...}} handshake. The reply (which contains
  * saslSupportedMechs, maxBsonObjectSize, etc.) is copied into `reply_out`;
- * caller must bson_destroy() it on success. */
-int mongo_handshake(mongo_transport_t *t, const char *app_name, const char *board_name, bson_t *reply_out,
-                    uint32_t timeout_ms);
+ * caller must bson_destroy() it on success.
+ *
+ * If `sasl_user_db` is non-NULL (e.g. "admin.picotest"), it goes into the
+ * `saslSupportedMechs` field of the hello request; the server's reply will
+ * then include a `saslSupportedMechs` array listing exactly which auth
+ * mechanisms are enabled for that user, which is what you want to log
+ * before deciding whether to attempt SCRAM-SHA-256. */
+int mongo_handshake(mongo_transport_t *t, const char *app_name, const char *board_name, const char *sasl_user_db,
+                    bson_t *reply_out, uint32_t timeout_ms);
 
 /* Run SCRAM-SHA-256. `auth_source` is the database to authenticate against
  * (typically "admin" for Atlas users). Caller must have already completed
