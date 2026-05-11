@@ -33,6 +33,12 @@
 #define MEMP_NUM_TCP_SEG 32
 #define MEMP_NUM_ARP_QUEUE 10
 #define PBUF_POOL_SIZE 24
+/* lwIP's default sys-timeout pool is just barely big enough for its own
+ * internal timers (TCP retransmit/persist, DHCP renewal, DNS retry, ARP
+ * refresh) and gets exhausted as soon as SNTP adds its periodic-resync
+ * timer on top. Bumping to 16 gives plenty of headroom for typical
+ * reconnect / DNS lookup interleavings. */
+#define MEMP_NUM_SYS_TIMEOUT 16
 
 #define LWIP_ARP 1
 #define LWIP_ETHERNET 1
