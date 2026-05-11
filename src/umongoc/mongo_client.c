@@ -41,6 +41,12 @@ struct mongo_client {
     mongo_transport_t *t;
     bool connected;
 
+    /* Reconnect backoff state. Each failed connect attempt bumps the counter
+     * and sets next_attempt_tick so the following call waits at least the
+     * computed delay before hitting the network again. Reset on success. */
+    uint32_t consecutive_failures;
+    TickType_t next_attempt_tick;
+
     /* Serializes network I/O across concurrent callers. Priority-inheriting
      * so a low-prio task holding it during a TLS handshake doesn't
      * priority-invert the rest of the system. */
@@ -159,10 +165,41 @@ static int rebuild_transport(mongo_client_t *c) {
     return c->t ? 0 : MONGO_WIRE_ERR_ALLOC;
 }
 
+/* 1 s, 2 s, 4 s, 8 s, 16 s, 32 s, 60 s, 60 s, ... -- caps at one minute. */
+static uint32_t backoff_delay_ms(uint32_t failures) {
+    if (failures == 0) {
+        return 0;
+    }
+    uint32_t shift = failures - 1;
+    if (shift > 6) {
+        shift = 6;
+    }
+    uint32_t ms = (uint32_t)1000 << shift;
+    if (ms > 60000) {
+        ms = 60000;
+    }
+    return ms;
+}
+
 /* Assumes c->mutex is held by the caller. */
 static int connect_locked(mongo_client_t *c, uint32_t timeout_ms) {
     if (c->connected) {
         return 0;
+    }
+
+    /* Exponential backoff between reconnect attempts. Holds the mutex while
+     * sleeping, which is intentional: in this driver "wait for the network
+     * to come back" is the desired semantic when Atlas is unreachable, not
+     * "fail every call until the user retries." The cap at 60 s keeps even
+     * pathological outages responsive once the network does recover. */
+    if (c->consecutive_failures > 0) {
+        TickType_t now = xTaskGetTickCount();
+        if ((int32_t)(c->next_attempt_tick - now) > 0) {
+            TickType_t wait = c->next_attempt_tick - now;
+            warning("[client] backing off %lu ms before reconnect (failures=%lu)",
+                    (unsigned long)(wait * portTICK_PERIOD_MS), (unsigned long)c->consecutive_failures);
+            vTaskDelay(wait);
+        }
     }
 
     /* Reset target to the first SRV host on every fresh connect attempt --
@@ -243,11 +280,17 @@ static int connect_locked(mongo_client_t *c, uint32_t timeout_ms) {
 
         bson_destroy(&hello_reply);
         c->connected = true;
+        c->consecutive_failures = 0;
         info("[client] ready (host=%s:%u)", c->target_host, c->target_port);
         return 0;
     }
 
-    error("[client] exhausted %d connect attempts; last rc=%d", MAX_REDIRECTS, last_rc);
+    /* All redirect attempts in this call failed: bump the backoff counter and
+     * schedule the earliest time the next caller can try again. */
+    c->consecutive_failures++;
+    c->next_attempt_tick = xTaskGetTickCount() + pdMS_TO_TICKS(backoff_delay_ms(c->consecutive_failures));
+    error("[client] exhausted %d connect attempts; last rc=%d (next retry in %lu ms)", MAX_REDIRECTS, last_rc,
+          (unsigned long)backoff_delay_ms(c->consecutive_failures));
     return last_rc;
 }
 
