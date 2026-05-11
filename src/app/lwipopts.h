@@ -26,6 +26,17 @@
 #define LWIP_ALTCP_TLS 1
 #define LWIP_ALTCP_TLS_MBEDTLS 1
 
+/* lwIP's altcp_tls default is MBEDTLS_SSL_VERIFY_OPTIONAL, which lets the
+ * handshake complete even when the server cert chain doesn't validate
+ * against our embedded CA -- it only flags the failure via
+ * mbedtls_ssl_get_verify_result(). For a MongoDB client that's a quiet
+ * MITM hole. VERIFY_REQUIRED makes mbedtls_ssl_handshake() itself return
+ * an error on a bad chain, so our altcp connect callback gets the error
+ * and we refuse to send any wire bytes. The value comes from mbedtls
+ * (MBEDTLS_SSL_VERIFY_REQUIRED == 2); using the integer directly avoids
+ * pulling mbedtls/ssl.h into lwipopts.h, which is included very early. */
+#define ALTCP_MBEDTLS_AUTHMODE 2
+
 /* Buffer & memory sizing. These are conservative; revisit if we see drops. */
 #define MEM_LIBC_MALLOC 0
 #define MEM_ALIGNMENT 4
