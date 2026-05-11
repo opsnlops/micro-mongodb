@@ -24,10 +24,17 @@ static SemaphoreHandle_t g_sync_sem = NULL;
 
 void mongo_time_set_unix_seconds(unsigned int sec) {
     int64_t now_boot_ms = (int64_t)to_ms_since_boot(get_absolute_time());
-    g_boot_offset_ms = (int64_t)sec * 1000 - now_boot_ms;
+    int64_t new_offset = (int64_t)sec * 1000 - now_boot_ms;
+    /* int64_t writes are non-atomic on a 32-bit ARM core. The read path
+     * (mongo_time_now_ms) does the matching critical-section pair so it
+     * never observes a half-updated value. taskENTER_CRITICAL acquires the
+     * SMP-aware kernel spinlock on RP2040/RP2350 dual-core. */
+    taskENTER_CRITICAL();
+    g_boot_offset_ms = new_offset;
     g_time_synced = true;
+    taskEXIT_CRITICAL();
     info("[time] SNTP synced: unix=%u s, boot=%lld ms, offset=%lld ms", sec, (long long)now_boot_ms,
-         (long long)g_boot_offset_ms);
+         (long long)new_offset);
     if (g_sync_sem) {
         xSemaphoreGive(g_sync_sem);
     }
@@ -59,10 +66,18 @@ int mongo_time_sync(uint32_t timeout_ms) {
 }
 
 int64_t mongo_time_now_ms(void) {
+    /* Snapshot both halves of the 64-bit offset under the critical section.
+     * Skip the work entirely if we haven't synced yet -- callers treat 0 as
+     * "no wall clock available." Reading g_time_synced (a bool, single byte)
+     * outside the critical section is fine; the offset must be inside. */
     if (!g_time_synced) {
         return 0;
     }
-    return (int64_t)to_ms_since_boot(get_absolute_time()) + g_boot_offset_ms;
+    int64_t offset;
+    taskENTER_CRITICAL();
+    offset = g_boot_offset_ms;
+    taskEXIT_CRITICAL();
+    return (int64_t)to_ms_since_boot(get_absolute_time()) + offset;
 }
 
 bool mongo_time_is_synced(void) { return g_time_synced; }
