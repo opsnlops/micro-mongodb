@@ -8,6 +8,8 @@
 #include "semphr.h"
 #include "task.h"
 
+#include "mbedtls/platform_util.h"
+
 #include "logging.h"
 #include "mongo_auth.h"
 #include "mongo_crud.h"
@@ -112,6 +114,10 @@ void mongo_client_free(mongo_client_t *c) {
     if (c->mutex) {
         vSemaphoreDelete(c->mutex);
     }
+    /* Wipe the struct before freeing -- the URI struct contains the user's
+     * username and password copy. mbedtls_platform_zeroize isn't elided by
+     * the optimizer the way memset(0) on a soon-to-be-freed buffer can be. */
+    mbedtls_platform_zeroize(c, sizeof *c);
     vPortFree(c);
 }
 

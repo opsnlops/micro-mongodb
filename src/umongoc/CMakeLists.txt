@@ -17,6 +17,15 @@ add_library(umongoc STATIC
 set(NTP_SERVER "pool.ntp.org" CACHE STRING "Hostname of the NTP server for SNTP time sync")
 target_compile_definitions(umongoc PRIVATE NTP_SERVER="${NTP_SERVER}")
 
+# Build-time debug flag for SCRAM internals. **Never** enable for a binary
+# that runs in production -- the log output includes salted_password and
+# the client/server keys, which are enough to impersonate the user. Default
+# off; flip with `cmake -DMONGO_SCRAM_DEBUG=1 ..`.
+option(MONGO_SCRAM_DEBUG "Log SCRAM intermediates (UNSAFE -- credentials in log)" OFF)
+if(MONGO_SCRAM_DEBUG)
+    target_compile_definitions(umongoc PRIVATE MONGO_SCRAM_DEBUG=1)
+endif()
+
 target_include_directories(umongoc PUBLIC
     ${CMAKE_CURRENT_LIST_DIR}
 )

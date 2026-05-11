@@ -131,7 +131,7 @@ struct LogMessage createMessageObject(uint8_t level, const char *message, va_lis
  *
  * @return true if logging is safe, false otherwise
  */
-bool is_safe_to_log();
+bool is_safe_to_log(void);
 
 /**
  * @brief Start the log reader task

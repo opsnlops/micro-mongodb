@@ -9,13 +9,14 @@
  * accessible to a host tool, etc.) without touching call sites.
  */
 
+#include <stddef.h>
 #include <stdio.h>
 
 #include "logging_api.h"
 #include "logging_config.h"
 #include "types.h"
 
-void acw_post_logging_hook(char *message, u8 message_length) {
+void acw_post_logging_hook(char *message, size_t message_length) {
     (void)message_length;
 
 #if LOGGING_LOG_VIA_PRINTF

@@ -37,7 +37,7 @@ void logger_init() {
     start_log_reader();
 }
 
-bool inline is_safe_to_log() {
+bool is_safe_to_log(void) {
     /* xQueueIsQueueFullFromISR is an ISR-only API; calling it from task
      * context is documented as undefined. Skip the precheck -- the
      * xQueueSendToBack call below already handles a full queue gracefully

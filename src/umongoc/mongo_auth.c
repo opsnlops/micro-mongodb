@@ -734,7 +734,14 @@ int mongo_authenticate(mongo_transport_t *t, const bson_t *hello_reply, const ch
         bson_iter_t arr;
         if (bson_iter_recurse(&it, &arr)) {
             have_mechs_list = true;
-            while (bson_iter_next(&arr) && BSON_ITER_HOLDS_UTF8(&arr)) {
+            /* Continue scanning past non-UTF8 entries instead of stopping --
+             * a future server might add an entry of an unrelated type that
+             * we shouldn't read, but we still want to see any UTF-8 entries
+             * after it. */
+            while (bson_iter_next(&arr)) {
+                if (!BSON_ITER_HOLDS_UTF8(&arr)) {
+                    continue;
+                }
                 const char *m = bson_iter_utf8(&arr, NULL);
                 if (strcmp(m, "SCRAM-SHA-256") == 0) {
                     has_sha256 = true;
