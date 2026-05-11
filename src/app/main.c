@@ -24,6 +24,7 @@
 #include <bson/bson.h>
 
 #include "logging.h"
+#include "mongo_auth.h"
 #include "mongo_crud.h"
 #include "mongo_cursor.h"
 #include "mongo_transport.h"
@@ -270,7 +271,38 @@ static void network_task(void *arg) {
             vTaskDelay(pdMS_TO_TICKS(5000));
             continue;
         }
-        info("connected (%d us), running smoke test", t_connect);
+        info("connected (%d us, %s)", t_connect, uri.tls ? "TLS" : "plain");
+
+        /* hello handshake */
+        TIMED_BEGIN(hello);
+        bson_t hello_reply;
+        int hrc = mongo_handshake(t, "micro-mongodb-demo", BOARD_NAME, &hello_reply, CMD_TIMEOUT_MS);
+        int t_hello = TIMED_US(hello);
+        if (hrc != MONGO_AUTH_OK) {
+            error("hello failed: rc=%d (%d us)", hrc, t_hello);
+            mongo_transport_close(t);
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+        bson_destroy(&hello_reply);
+        info("hello ok (%d us)", t_hello);
+
+        /* SCRAM if credentials are configured. */
+        int t_scram = 0;
+        if (uri.username[0] && uri.password[0]) {
+            TIMED_BEGIN(scram);
+            int arc = mongo_authenticate_scram_sha256(t, uri.auth_source, uri.username, uri.password, CMD_TIMEOUT_MS);
+            t_scram = TIMED_US(scram);
+            if (arc != MONGO_AUTH_OK) {
+                error("scram failed: rc=%d (%d us)", arc, t_scram);
+                mongo_transport_close(t);
+                vTaskDelay(pdMS_TO_TICKS(5000));
+                continue;
+            }
+            info("scram ok (%d us)", t_scram);
+        }
+
+        info("running smoke test");
         rc = run_smoke_test(t);
         if (rc == MONGO_WIRE_OK) {
             info("smoke test passed");

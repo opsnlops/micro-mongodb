@@ -6,6 +6,7 @@ add_library(umongoc STATIC
     mongo_dns.c
     mongo_uri.c
     mongo_ca.c
+    mongo_auth.c
 )
 
 target_include_directories(umongoc PUBLIC
