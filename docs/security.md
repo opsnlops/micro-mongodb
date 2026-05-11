@@ -13,6 +13,19 @@ against Atlas's cert chain, including X.509 verification against the
 embedded ISRG Root X1 (Let's Encrypt). SNI is set explicitly. mbedTLS
 rejects an invalid chain — there's no "skip verify" flag.
 
+We override lwIP's default `ALTCP_MBEDTLS_AUTHMODE`
+(`MBEDTLS_SSL_VERIFY_OPTIONAL`) with `MBEDTLS_SSL_VERIFY_REQUIRED`
+in `src/app/lwipopts.h`. The default would let the handshake
+complete on a bad chain and only reflect the failure via
+`mbedtls_ssl_get_verify_result()`, which the altcp wrapper never
+reads — meaning a MITM with any cert would have been silently
+accepted. With `VERIFY_REQUIRED`, `mbedtls_ssl_handshake()` itself
+returns an error on a bad chain and the connect callback gets it.
+
+Certificate validity dates (`notBefore` / `notAfter`) are also
+checked: `MBEDTLS_HAVE_TIME_DATE` is defined and `mbedtls_time` is
+pointed at our SNTP-synced wall clock via `MBEDTLS_PLATFORM_TIME_MACRO`.
+
 **Credentials in the URI are URL-decoded** before reaching SCRAM, so
 passwords containing `@`, `/`, `:`, etc. (which Atlas's UI percent-encodes)
 work correctly.
@@ -39,10 +52,12 @@ and peg the M0+ for days. Reply size is capped at 16 MB.
 before libbson's iterator gets to walk it, closing the surface area
 to libbson's wire-parser bugs.
 
-**SCRAM intermediates are zeroized** on the success path —
+**SCRAM intermediates are zeroized on every return path.**
 `salted_password`, `client_key`, `stored_key`, `server_key`,
-`client_signature`, `client_proof`, the prepped password, and the
-nonce raw bytes all get wiped before the SCRAM function returns OK.
+`client_signature`, `client_proof`, `expected_sig`, `salt`,
+`actual_sig`, the prepped password, and the nonce raw bytes all
+get wiped before the SCRAM function returns — success or error —
+via a single `done:` label that every exit routes through.
 
 **SNTP errors don't cascade.** If NTP fails (server unreachable,
 network blip), the firmware logs a warning and continues with
@@ -60,18 +75,6 @@ non-ASCII passwords up-front with `MONGO_AUTH_ERR_ASCII_ONLY` and a
 clear error log.
 
 Don't use non-ASCII characters in your Atlas user passwords.
-
-### Error-path zeroization (H5 partial)
-
-The SCRAM intermediates are wiped on the *success* return path. Error
-paths between PBKDF2 and return don't currently zeroize — if the
-function bails out (e.g. server returns an unexpected reply), salted-
-password-derived material may be left on the stack until that memory
-is reused.
-
-To fix properly would require a full `goto cleanup;` refactor of the
-~500-line SCRAM function. On the to-do list; low practical risk on a
-device with no MMU / no swap / no remote-attach debug surface.
 
 ### libbson allocation failure paths
 
@@ -104,21 +107,30 @@ host lists.
 
 ### Plain TCP SCRAM (`mongodb://` without TLS)
 
-If you connect with `mongodb://` and credentials, the driver logs a
-warning:
+If you connect with `mongodb://` and credentials, the driver refuses
+and returns `MONGO_AUTH_ERR_INSECURE`:
 
 ```
-[W] [client] SCRAM over plain TCP -- saslSupportedMechs unauthenticated,
-    proofs offline-attackable
+[E] [client] refusing SCRAM over plain TCP; add allowInsecureAuth=true
+    to override (local-dev only)
 ```
 
-Specifics: the `saslSupportedMechs` array is unauthenticated, so an
-attacker can strip `SCRAM-SHA-256` from it and force a SHA-1 downgrade.
-The proof itself isn't a password but it's offline-bruteforceable given
-sufficient compute.
+The reasoning: the `saslSupportedMechs` array is unauthenticated
+without TLS, so an attacker can strip `SCRAM-SHA-256` from it and
+force a SHA-1 downgrade. The proof itself isn't a password but it's
+offline-bruteforceable given sufficient compute.
 
-**Mitigation:** don't run SCRAM over plain TCP. Either use TLS or use
-a local mongod with `--noauth` for development.
+**Escape hatch for local development:** add `allowInsecureAuth=true`
+to the URI options:
+
+```
+mongodb://user:pass@dev-host:27017/?allowInsecureAuth=true
+```
+
+This re-enables the previous warn-and-continue behavior. The flag is
+URI-only — TXT records can't set it — so a hostile DNS resolver
+can't turn it on for an `mongodb+srv://` connection. Atlas always
+uses TLS so the flag is never needed there.
 
 ### `MONGO_SCRAM_DEBUG` leaks credentials
 

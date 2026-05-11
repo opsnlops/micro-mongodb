@@ -196,21 +196,38 @@ each operation. Likely causes:
 
 ## time-series collection doesn't get created
 
+There are two cases. If the collection already exists (a previous boot
+already created it), the driver silently treats that as success — you'll
+see this in the log:
+
 ```
 [I] [client] ready
-(...no "created time-series collection" line follows...)
+[D] [client] time-series collection micro_mongodb.telemetry already exists
+```
+
+That's the happy path. Inserts will work normally.
+
+If the create command returned an error code that *isn't* "already
+exists" (48), the warning + error pair shows up instead:
+
+```
 [W] [client] could not create time-series collection micro_mongodb.telemetry --
     if it exists as a regular collection, drop it in Atlas and reboot
 [E] [mongo] create timeseries rejected: code=...
 ```
 
-If the code is `48` (NamespaceExists), a regular collection with the
-same name already exists. You can't convert in place — drop it in
-Atlas (`db.telemetry.drop()` in mongosh, or the Atlas UI), then reboot.
-
-If the code is something else, the user probably lacks
+This is typically `code=13` (Unauthorized) — the user lacks
 `createCollection` permission. Grant `dbAdminAnyDatabase` or, more
 narrowly, `dbAdmin` on the specific database.
+
+**Subtle case:** if a *regular* (non-time-series) collection with the
+same name pre-exists, MongoDB still returns `code=48` and the driver
+treats that as success. Inserts will subsequently fail because the
+existing collection's storage layout doesn't match the time-series
+expectation. Symptom: telemetry inserts succeed but Atlas Charts shows
+no time-bucketed data. Fix: drop the existing collection in Atlas
+(`db.telemetry.drop()` in mongosh) and reboot so the firmware recreates
+it as time-series.
 
 ## panic: sys_timeout pool empty
 

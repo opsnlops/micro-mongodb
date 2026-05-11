@@ -156,8 +156,13 @@ that boilerplate.
 ### `mongo_ca`
 
 The ISRG Root X1 (Let's Encrypt) PEM as a `const char[]`. Atlas's chain
-roots here. Apps can substitute their own CA via `mongo_tls_config_t.ca_pem`
-for self-hosted deployments.
+roots here.
+
+Apps can substitute their own CA via the lower-level `mongo_transport_new()`
+API by passing a `mongo_tls_config_t` with a non-NULL `ca_pem` field. The
+high-level `mongo_client_t` does not currently surface a custom-CA option
+on `mongo_client_config_t`; see "Use a different CA bundle" in
+`docs/examples.md` for the workaround and the open TODO.
 
 ## Build system
 

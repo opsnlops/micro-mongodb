@@ -1,5 +1,5 @@
 # Vendored libbson 1.28.0 + minimal `common/` shims, patched for arm-none-eabi
-# + newlib-nano + FreeRTOS. See src/bson/README.md for the porting decisions.
+# + newlib-nano + FreeRTOS. See docs/porting-libbson.md for the porting decisions.
 
 add_library(bson STATIC
     # libbson core

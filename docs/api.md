@@ -93,7 +93,7 @@ Delete the first document matching `filter`.
 ### `int mongo_client_run_command(c, db, cmd, reply, timeout_ms)`
 
 Escape hatch for arbitrary commands: `ping`, `aggregate`, `createIndexes`,
-`distinct`, etc. See the [aggregator example](examples.md#aggregator-task)
+`distinct`, etc. See the [aggregator example](examples.md#run-an-aggregate)
 for how to build a pipeline.
 
 ## Time-series helper
