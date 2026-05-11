@@ -1,5 +1,6 @@
 add_library(umongoc STATIC
     mongo_transport.c
+    mongo_wire.c
 )
 
 target_include_directories(umongoc PUBLIC
