@@ -143,16 +143,22 @@ static void udp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip
         pbuf_free(p);
         return;
     }
-    u16_t copied = pbuf_copy_partial(p, ctx->reply, p->tot_len, 0);
+    /* Snapshot tot_len before freeing the pbuf -- accessing p->tot_len
+     * after pbuf_free is a use-after-free. */
+    const u16_t pkt_len = p->tot_len;
+    u16_t copied = pbuf_copy_partial(p, ctx->reply, pkt_len, 0);
     pbuf_free(p);
-    if (copied != p->tot_len) {
+    if (copied != pkt_len) {
         return;
     }
-    ctx->reply_len = copied;
+    /* Only commit the reply (and signal the waiter) once we know the packet
+     * is the one we asked for. A second UDP packet that arrived between
+     * udp_recv_cb firing and udp_remove() must not clobber ctx->reply. */
     uint16_t resp_id = (uint16_t)((ctx->reply[0] << 8) | ctx->reply[1]);
     if (resp_id != ctx->expect_id) {
         return; /* not ours -- keep waiting */
     }
+    ctx->reply_len = copied;
     ctx->ok = true;
     BaseType_t hp_woken = pdFALSE;
     xSemaphoreGiveFromISR(ctx->sem, &hp_woken);

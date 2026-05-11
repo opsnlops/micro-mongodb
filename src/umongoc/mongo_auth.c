@@ -16,11 +16,13 @@
 #include "logging.h"
 #include "mongo_wire.h"
 
-/* Detailed SCRAM diagnostic logging. Leaks salted-password-derived material
- * to the log, so set to 0 (the default once we've debugged auth) for normal
- * operation. Re-enable with -DMONGO_SCRAM_DEBUG=1 at the CMake level. */
+/* Detailed SCRAM diagnostic logging. When on, this prints salted-password-
+ * derived material (client_key, salted_password, client_proof, the literal
+ * auth_message, etc.) to the log -- which is sufficient material to
+ * impersonate the user. Default is OFF; flip with -DMONGO_SCRAM_DEBUG=1 at
+ * the cmake level while debugging an auth failure. */
 #ifndef MONGO_SCRAM_DEBUG
-#define MONGO_SCRAM_DEBUG 1
+#define MONGO_SCRAM_DEBUG 0
 #endif
 
 #if MONGO_SCRAM_DEBUG

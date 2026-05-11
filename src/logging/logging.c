@@ -167,15 +167,21 @@ portTASK_FUNCTION(log_queue_reader_task, pvParameters) {
             // Format our messaging
             u32 time = to_ms_since_boot(get_absolute_time());
 
-            // Create space on the heap for the message
-            char *message = (char *)pvPortMalloc(strlen(lm.message) + 33);
-            memset(message, '\0', strlen(lm.message) + 33);
-            snprintf(message, strlen(lm.message) + 32, "LOG\t%lu\t%s\t%s", time, levelBuffer, lm.message);
+            // Create space on the heap for the message. If the FreeRTOS heap
+            // can't satisfy us right now, drop this log line on the floor
+            // rather than NULL-deref'ing the memset/snprintf below (which
+            // would crash the device, since the malloc-failed hook panics).
+            size_t needed = strlen(lm.message) + 33;
+            char *message = (char *)pvPortMalloc(needed);
+            if (message != NULL) {
+                memset(message, '\0', needed);
+                snprintf(message, needed - 1, "LOG\t%lu\t%s\t%s", time, levelBuffer, lm.message);
 
-            // Allow the running application to hook in
-            acw_post_logging_hook(message, strlen(message));
+                // Allow the running application to hook in
+                acw_post_logging_hook(message, strlen(message));
 
-            vPortFree(message);
+                vPortFree(message);
+            }
 
             // Wipe the buffer for next time
             memset(&levelBuffer, '\0', 4);
