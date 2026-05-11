@@ -24,5 +24,6 @@
 
 #include "mongo_client.h"
 #include "mongo_cursor.h"
+#include "mongo_time.h"
 #include "mongo_wifi.h"
 #include "mongo_wire.h" /* for MONGO_WIRE_OK / MONGO_WIRE_ERR_* status codes */

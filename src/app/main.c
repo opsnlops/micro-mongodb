@@ -45,6 +45,15 @@ static void app_task(void *arg) {
         }
     }
 
+    /* SNTP -- gets us real Unix-epoch time. Non-fatal if it fails (we still
+     * have monotonic time for sequencing), but most telemetry use cases want
+     * wall-clock timestamps so try hard. */
+    if (mongo_time_sync(15000) != 0) {
+        warning("[app] continuing without wall-clock time");
+    } else {
+        info("[app] wall clock: %lld ms", (long long)mongo_time_now_ms());
+    }
+
     mongo_client_config_t cfg = {
         .mongo_uri = MONGO_URI,
         .app_name = "micro-mongodb-demo",

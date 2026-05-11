@@ -47,6 +47,13 @@
 #define LWIP_STATS 0
 #define LWIP_STATS_DISPLAY 0
 
+/* SNTP -- handed each new time fix via SNTP_SET_SYSTEM_TIME. The function
+ * declared here lives in src/umongoc/mongo_time.c and translates the seconds
+ * into a boot-tick offset that mongo_time_now_ms() reads. */
+extern void mongo_time_set_unix_seconds(unsigned int sec);
+#define SNTP_SET_SYSTEM_TIME(sec) mongo_time_set_unix_seconds((unsigned int)(sec))
+#define SNTP_SERVER_DNS 1 /* let us pass "pool.ntp.org" by name to sntp_setservername */
+
 /* tcpip_thread settings (FreeRTOS task that owns the lwIP core) */
 #define TCPIP_THREAD_STACKSIZE 2048
 #define TCPIP_THREAD_PRIO 8
