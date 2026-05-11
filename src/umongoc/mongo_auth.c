@@ -31,6 +31,59 @@ static double reply_ok(const bson_t *reply) {
     return 0.0;
 }
 
+const char *mongo_auth_status_str(int status) {
+    switch (status) {
+    case MONGO_AUTH_OK:
+        return "OK";
+    case MONGO_AUTH_ERR_ARGS:
+        return "ARGS";
+    case MONGO_AUTH_ERR_ALLOC:
+        return "ALLOC";
+    case MONGO_AUTH_ERR_PROTOCOL:
+        return "PROTOCOL";
+    case MONGO_AUTH_ERR_TRANSPORT:
+        return "TRANSPORT";
+    case MONGO_AUTH_ERR_ASCII_ONLY:
+        return "ASCII_ONLY (non-ASCII password rejected by ASCII-only build)";
+    case MONGO_AUTH_ERR_NONCE_MISMATCH:
+        return "NONCE_MISMATCH (server-side replay / tampering)";
+    case MONGO_AUTH_ERR_SERVER_REJECTED:
+        return "SERVER_REJECTED (auth failed; check username/password/authSource)";
+    case MONGO_AUTH_ERR_SERVER_SIG:
+        return "SERVER_SIG (server signature did not verify -- MITM or impl bug)";
+    case MONGO_AUTH_ERR_CRYPTO:
+        return "CRYPTO (mbedTLS primitive failed)";
+    default:
+        return "?";
+    }
+}
+
+/* Log the server-side error info from a failed reply. Atlas / mongod returns
+ * {ok:0, errmsg, code, codeName}; surfacing those is much more useful than
+ * a numeric driver code. Safe on replies that don't have these fields. */
+static void log_server_rejection(const char *phase, const bson_t *reply) {
+    bson_iter_t it;
+    const char *errmsg = NULL;
+    int code = 0;
+    const char *codename = NULL;
+
+    if (bson_iter_init_find(&it, reply, "errmsg") && BSON_ITER_HOLDS_UTF8(&it)) {
+        errmsg = bson_iter_utf8(&it, NULL);
+    }
+    if (bson_iter_init_find(&it, reply, "code") && BSON_ITER_HOLDS_INT32(&it)) {
+        code = bson_iter_int32(&it);
+    }
+    if (bson_iter_init_find(&it, reply, "codeName") && BSON_ITER_HOLDS_UTF8(&it)) {
+        codename = bson_iter_utf8(&it, NULL);
+    }
+    if (errmsg || code != 0 || codename) {
+        error("[auth] %s rejected: code=%d codeName=%s errmsg=%s", phase, code, codename ? codename : "(none)",
+              errmsg ? errmsg : "(none)");
+    } else {
+        error("[auth] %s rejected (no errmsg in reply)", phase);
+    }
+}
+
 int mongo_handshake(mongo_transport_t *t, const char *app_name, const char *board_name, bson_t *reply_out,
                     uint32_t timeout_ms) {
     if (!t || !reply_out) {
@@ -75,7 +128,7 @@ int mongo_handshake(mongo_transport_t *t, const char *app_name, const char *boar
         return MONGO_AUTH_ERR_TRANSPORT;
     }
     if (reply_ok(reply_out) < 1.0) {
-        error("[auth] hello: server rejected (ok!=1)");
+        log_server_rejection("hello", reply_out);
         bson_destroy(reply_out);
         return MONGO_AUTH_ERR_SERVER_REJECTED;
     }
@@ -187,6 +240,7 @@ int mongo_authenticate_scram_sha256(mongo_transport_t *t, const char *auth_sourc
         return MONGO_AUTH_ERR_TRANSPORT;
     }
     if (reply_ok(&reply) < 1.0) {
+        log_server_rejection("saslStart/Continue", &reply);
         bson_destroy(&reply);
         return MONGO_AUTH_ERR_SERVER_REJECTED;
     }
@@ -318,6 +372,7 @@ int mongo_authenticate_scram_sha256(mongo_transport_t *t, const char *auth_sourc
         return MONGO_AUTH_ERR_TRANSPORT;
     }
     if (reply_ok(&reply) < 1.0) {
+        log_server_rejection("saslStart/Continue", &reply);
         bson_destroy(&reply);
         return MONGO_AUTH_ERR_SERVER_REJECTED;
     }

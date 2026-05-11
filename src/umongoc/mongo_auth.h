@@ -41,6 +41,10 @@ typedef enum {
     MONGO_AUTH_ERR_CRYPTO = -9,
 } mongo_auth_status_t;
 
+/* Return a human-readable name for a mongo_auth_status_t code, e.g.
+ * "SERVER_REJECTED" for -7. */
+const char *mongo_auth_status_str(int status);
+
 /* Run the {hello: 1, client: {...}} handshake. The reply (which contains
  * saslSupportedMechs, maxBsonObjectSize, etc.) is copied into `reply_out`;
  * caller must bson_destroy() it on success. */

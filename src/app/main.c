@@ -279,7 +279,7 @@ static void network_task(void *arg) {
         int hrc = mongo_handshake(t, "micro-mongodb-demo", BOARD_NAME, &hello_reply, CMD_TIMEOUT_MS);
         int t_hello = TIMED_US(hello);
         if (hrc != MONGO_AUTH_OK) {
-            error("hello failed: rc=%d (%d us)", hrc, t_hello);
+            error("hello failed: %s (rc=%d, %d us)", mongo_auth_status_str(hrc), hrc, t_hello);
             mongo_transport_close(t);
             vTaskDelay(pdMS_TO_TICKS(5000));
             continue;
@@ -294,7 +294,7 @@ static void network_task(void *arg) {
             int arc = mongo_authenticate_scram_sha256(t, uri.auth_source, uri.username, uri.password, CMD_TIMEOUT_MS);
             t_scram = TIMED_US(scram);
             if (arc != MONGO_AUTH_OK) {
-                error("scram failed: rc=%d (%d us)", arc, t_scram);
+                error("scram failed: %s (rc=%d, %d us)", mongo_auth_status_str(arc), arc, t_scram);
                 mongo_transport_close(t);
                 vTaskDelay(pdMS_TO_TICKS(5000));
                 continue;
