@@ -155,6 +155,15 @@ static void apply_option(mongo_uri_t *out, const char *key, size_t klen, const c
         copy_n(out->replica_set, sizeof out->replica_set, val, vlen);
     } else if (klen == 10 && strncmp(key, "authSource", 10) == 0) {
         copy_n(out->auth_source, sizeof out->auth_source, val, vlen);
+    } else if (klen == 17 && strncmp(key, "allowInsecureAuth", 17) == 0) {
+        /* URI-only escape hatch: send SCRAM over plain TCP. Not honored from
+         * TXT -- spec doesn't allow it there, and we don't want an attacker
+         * who controls DNS to turn it on. */
+        if (source == OPT_SOURCE_TXT) {
+            warning("[uri] rejecting allowInsecureAuth= from TXT record");
+            return;
+        }
+        out->allow_insecure_auth = (vlen == 4 && strncmp(val, "true", 4) == 0);
     } else if (source == OPT_SOURCE_TXT) {
         warning("[uri] dropping unrecognized TXT option key: %.*s", (int)klen, key);
     }

@@ -39,6 +39,7 @@ typedef enum {
     MONGO_AUTH_ERR_SERVER_REJECTED = -7,
     MONGO_AUTH_ERR_SERVER_SIG = -8,
     MONGO_AUTH_ERR_CRYPTO = -9,
+    MONGO_AUTH_ERR_INSECURE = -10, /* credentials present, TLS off, allowInsecureAuth not set */
 } mongo_auth_status_t;
 
 /* Return a human-readable name for a mongo_auth_status_t code, e.g.

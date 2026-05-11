@@ -214,8 +214,22 @@ static int connect_locked(mongo_client_t *c, uint32_t timeout_ms) {
          * retrying with the same password. */
         if (c->uri.username[0] && c->uri.password[0]) {
             if (!c->uri.tls) {
-                warning(
-                    "[client] SCRAM over plain TCP -- saslSupportedMechs unauthenticated, proofs offline-attackable");
+                if (!c->uri.allow_insecure_auth) {
+                    /* Refuse to send credentials over a cleartext link. The
+                     * saslSupportedMechs reply is unauthenticated on plain
+                     * TCP (attacker can strip SHA-256 to force a SHA-1
+                     * downgrade), and the SCRAM client proof is offline-
+                     * bruteforceable. The user can opt back in for local
+                     * development by adding `allowInsecureAuth=true` to the
+                     * URI options. */
+                    error("[client] refusing SCRAM over plain TCP; add allowInsecureAuth=true to override "
+                          "(local-dev only)");
+                    bson_destroy(&hello_reply);
+                    mongo_transport_close(c->t);
+                    return MONGO_AUTH_ERR_INSECURE;
+                }
+                warning("[client] SCRAM over plain TCP (allowInsecureAuth=true) -- saslSupportedMechs "
+                        "unauthenticated, proofs offline-attackable");
             }
             rc = mongo_authenticate(c->t, &hello_reply, c->uri.auth_source, c->uri.username, c->uri.password,
                                     timeout_ms);

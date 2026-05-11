@@ -150,6 +150,8 @@ const char *mongo_auth_status_str(int status) {
         return "SERVER_SIG (server signature did not verify -- MITM or impl bug)";
     case MONGO_AUTH_ERR_CRYPTO:
         return "CRYPTO (mbedTLS primitive failed)";
+    case MONGO_AUTH_ERR_INSECURE:
+        return "INSECURE (refusing SCRAM over plain TCP; set allowInsecureAuth=true to override)";
     default:
         return "?";
     }

@@ -38,6 +38,14 @@ typedef struct {
     char replica_set[MONGO_URI_FIELD_MAX];
     char auth_source[MONGO_URI_FIELD_MAX]; /* default "admin" for SCRAM */
     bool is_srv;                           /* true if parsed from mongodb+srv:// */
+
+    /* Opt-in: send SCRAM credentials over an unencrypted mongodb:// link.
+     * Default is to refuse the connection (return MONGO_AUTH_ERR_INSECURE)
+     * when credentials are present and TLS is off. Set by including
+     * `allowInsecureAuth=true` in the URI options (dev-only escape hatch).
+     * Atlas users should never need this; their URI is always
+     * mongodb+srv://, which forces tls=true. */
+    bool allow_insecure_auth;
 } mongo_uri_t;
 
 typedef enum {
