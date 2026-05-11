@@ -1,8 +1,10 @@
 #include "mongo_dns.h"
 
+#include <ctype.h>
 #include <string.h>
 
 #include "pico/cyw43_arch.h"
+#include "pico/rand.h"
 
 #include "FreeRTOS.h"
 #include "semphr.h"
@@ -174,10 +176,16 @@ static int dns_round_trip(const char *name, uint16_t qtype, dns_recv_ctx_t *ctx,
 
     /* Build the query. */
     uint8_t query[DNS_MAX_PACKET];
-    static uint16_t id_counter = 1;
-    uint16_t id = id_counter++;
-    if (id_counter == 0) {
-        id_counter = 1;
+    /* Random transaction ID via the RP2x40/RP2350 ring-oscillator RNG.
+     * A monotonic counter is trivially guessable, which would let an off-path
+     * attacker race the legitimate response with a forged one (e.g. spoofed
+     * SRV record). The 16-bit ID isn't a strong defense on its own --
+     * cache-poisoning research shows ~1-in-65k birthday-style guesses succeed
+     * inside the timeout window -- but it raises the bar from "always" to
+     * "lottery" and combines with question-name verification below. */
+    uint16_t id = (uint16_t)get_rand_32();
+    if (id == 0) {
+        id = 1;
     }
     ctx->expect_id = id;
     query[0] = (uint8_t)(id >> 8);
@@ -260,11 +268,38 @@ static int dns_round_trip(const char *name, uint16_t qtype, dns_recv_ctx_t *ctx,
     return rc;
 }
 
-/* Walk past the question section (one question; same name we sent). */
-static int skip_question(const uint8_t *msg, size_t msg_len, size_t pos, size_t *new_pos) {
+/* RFC 1035 §3.1: DNS name comparison is case-insensitive across ASCII. */
+static bool dns_name_eq_ci(const char *a, const char *b) {
+    for (;; a++, b++) {
+        int ca = (unsigned char)*a;
+        int cb = (unsigned char)*b;
+        if (ca >= 'A' && ca <= 'Z') {
+            ca += 'a' - 'A';
+        }
+        if (cb >= 'A' && cb <= 'Z') {
+            cb += 'a' - 'A';
+        }
+        if (ca != cb) {
+            return false;
+        }
+        if (ca == '\0') {
+            return true;
+        }
+    }
+}
+
+/* Walk past the question section (one question; should be the same name we
+ * sent). Verifies the qname matches `expect_name` -- without that check, an
+ * off-path attacker could deliver a reply that won the tx-id lottery for some
+ * other in-flight query and we'd happily parse its answers as ours. */
+static int skip_question(const uint8_t *msg, size_t msg_len, size_t pos, const char *expect_name, size_t *new_pos) {
     char tmp[256];
     int consumed = decode_name(msg, msg_len, pos, tmp, sizeof tmp);
     if (consumed < 0) {
+        return MONGO_DNS_ERR_FORMAT;
+    }
+    if (expect_name && !dns_name_eq_ci(tmp, expect_name)) {
+        error("[dns] qname mismatch: got '%s' expected '%s'", tmp, expect_name);
         return MONGO_DNS_ERR_FORMAT;
     }
     pos += (size_t)consumed;
@@ -330,7 +365,7 @@ int mongo_dns_query_srv(const char *name, mongo_srv_record_t *out, size_t out_ca
     }
 
     size_t pos = 12;
-    rc = skip_question(ctx->reply, ctx->reply_len, pos, &pos);
+    rc = skip_question(ctx->reply, ctx->reply_len, pos, name, &pos);
     if (rc != MONGO_DNS_OK) {
         vSemaphoreDelete(ctx->sem);
         vPortFree(ctx);
@@ -411,7 +446,7 @@ int mongo_dns_query_txt(const char *name, char *out, size_t out_cap, uint32_t ti
     }
 
     size_t pos = 12;
-    rc = skip_question(ctx->reply, ctx->reply_len, pos, &pos);
+    rc = skip_question(ctx->reply, ctx->reply_len, pos, name, &pos);
     if (rc != MONGO_DNS_OK) {
         vSemaphoreDelete(ctx->sem);
         vPortFree(ctx);
