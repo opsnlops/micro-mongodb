@@ -324,39 +324,81 @@ static int scram_auth_run(mongo_transport_t *t, const scram_mech_t *mech, const 
     debug("[auth] %s user='%s' authSource='%s' pw_len=%u", mech->mechanism, username, auth_source,
           (unsigned)strlen(password));
 
-    /* Mechanism-specific password preprocessing. */
+    /* All buffers declared up front so the cleanup block (label `done:`) can
+     * zeroize them unconditionally on every return path, not just success.
+     * Password-derived material (prepped_pw, salted_password, the four key
+     * arrays) is the most sensitive; we wipe the rest as defense in depth. */
+    int ret = MONGO_AUTH_OK;
+    bool cmd_inited = false;
+    bool reply_inited = false;
+    bson_t cmd;
+    bson_t reply;
+
     char prepped_pw[64];
-    int prepped_len = mech->prep_password(username, password, prepped_pw, sizeof prepped_pw);
+    int prepped_len = 0;
+    uint8_t nonce_raw[SCRAM_NONCE_RAW];
+    char client_nonce[SCRAM_NONCE_B64];
+    size_t client_nonce_len = 0;
+    char client_first_bare[SCRAM_FIELD_MAX];
+    char client_first_msg[SCRAM_FIELD_MAX + sizeof SCRAM_GS2_HEADER];
+    char server_first[SCRAM_FIELD_MAX * 2];
+    char server_nonce[SCRAM_FIELD_MAX];
+    char salt_b64[SCRAM_FIELD_MAX];
+    char iter_str[16];
+    uint8_t salt[64];
+    uint8_t salted_password[SCRAM_MAX_KEY_LEN];
+    uint8_t client_key[SCRAM_MAX_KEY_LEN];
+    uint8_t stored_key[SCRAM_MAX_KEY_LEN];
+    uint8_t server_key[SCRAM_MAX_KEY_LEN];
+    char client_final_without_proof[SCRAM_FIELD_MAX];
+    char auth_message[SCRAM_AUTH_MSG_MAX];
+    uint8_t client_signature[SCRAM_MAX_KEY_LEN];
+    uint8_t client_proof[SCRAM_MAX_KEY_LEN];
+    char proof_b64[64];
+    char client_final[SCRAM_FIELD_MAX * 2];
+    uint8_t expected_sig[SCRAM_MAX_KEY_LEN];
+    uint8_t actual_sig[64];
+
+    int32_t conversation_id = 0;
+    int cfb_len = 0;
+    int cfm_len = 0;
+    bson_iter_t it;
+    bson_subtype_t subtype;
+    uint32_t bin_len = 0;
+    const uint8_t *bin_data = NULL;
+    int rc = 0;
+
+    /* Mechanism-specific password preprocessing. */
+    prepped_len = mech->prep_password(username, password, prepped_pw, sizeof prepped_pw);
     if (prepped_len < 0) {
-        return MONGO_AUTH_ERR_CRYPTO;
+        ret = MONGO_AUTH_ERR_CRYPTO;
+        goto done;
     }
 
     /* ---- client-first ---- */
-    uint8_t nonce_raw[SCRAM_NONCE_RAW];
     rand_bytes(nonce_raw, sizeof nonce_raw);
 
-    char client_nonce[SCRAM_NONCE_B64];
-    size_t client_nonce_len = 0;
     if (mbedtls_base64_encode((unsigned char *)client_nonce, sizeof client_nonce, &client_nonce_len, nonce_raw,
                               sizeof nonce_raw) != 0) {
-        return MONGO_AUTH_ERR_CRYPTO;
+        ret = MONGO_AUTH_ERR_CRYPTO;
+        goto done;
     }
     client_nonce[client_nonce_len] = '\0';
 
-    char client_first_bare[SCRAM_FIELD_MAX];
-    int cfb_len = snprintf(client_first_bare, sizeof client_first_bare, "n=%s,r=%s", username, client_nonce);
+    cfb_len = snprintf(client_first_bare, sizeof client_first_bare, "n=%s,r=%s", username, client_nonce);
     if (cfb_len < 0 || cfb_len >= (int)sizeof client_first_bare) {
-        return MONGO_AUTH_ERR_ARGS;
+        ret = MONGO_AUTH_ERR_ARGS;
+        goto done;
     }
 
-    char client_first_msg[SCRAM_FIELD_MAX + sizeof SCRAM_GS2_HEADER];
-    int cfm_len = snprintf(client_first_msg, sizeof client_first_msg, "%s%s", SCRAM_GS2_HEADER, client_first_bare);
+    cfm_len = snprintf(client_first_msg, sizeof client_first_msg, "%s%s", SCRAM_GS2_HEADER, client_first_bare);
     if (cfm_len < 0 || cfm_len >= (int)sizeof client_first_msg) {
-        return MONGO_AUTH_ERR_ARGS;
+        ret = MONGO_AUTH_ERR_ARGS;
+        goto done;
     }
 
-    bson_t cmd;
     bson_init(&cmd);
+    cmd_inited = true;
     BSON_APPEND_INT32(&cmd, "saslStart", 1);
     BSON_APPEND_UTF8(&cmd, "mechanism", mech->mechanism);
     bson_append_binary(&cmd, "payload", 7, BSON_SUBTYPE_BINARY, (const uint8_t *)client_first_msg, (uint32_t)cfm_len);
@@ -367,40 +409,37 @@ static int scram_auth_run(mongo_transport_t *t, const scram_mech_t *mech, const 
     BSON_APPEND_BOOL(&options, "skipEmptyExchange", true);
     bson_append_document_end(&cmd, &options);
 
-    bson_t reply;
-    int rc = mongo_run_command(t, auth_source, &cmd, &reply, timeout_ms);
+    rc = mongo_run_command(t, auth_source, &cmd, &reply, timeout_ms);
     bson_destroy(&cmd);
+    cmd_inited = false;
     if (rc != MONGO_WIRE_OK) {
-        return MONGO_AUTH_ERR_TRANSPORT;
+        ret = MONGO_AUTH_ERR_TRANSPORT;
+        goto done;
     }
+    reply_inited = true;
     if (reply_ok(&reply) < 1.0) {
         log_server_rejection("saslStart/Continue", &reply);
-        bson_destroy(&reply);
-        return MONGO_AUTH_ERR_SERVER_REJECTED;
+        ret = MONGO_AUTH_ERR_SERVER_REJECTED;
+        goto done;
     }
 
-    bson_iter_t it;
-    int32_t conversation_id = 0;
     if (bson_iter_init_find(&it, &reply, "conversationId") && BSON_ITER_HOLDS_INT32(&it)) {
         conversation_id = bson_iter_int32(&it);
     }
 
-    char server_first[SCRAM_FIELD_MAX * 2];
     if (!bson_iter_init_find(&it, &reply, "payload") || !BSON_ITER_HOLDS_BINARY(&it)) {
-        bson_destroy(&reply);
-        return MONGO_AUTH_ERR_PROTOCOL;
+        ret = MONGO_AUTH_ERR_PROTOCOL;
+        goto done;
     }
-    bson_subtype_t subtype;
-    uint32_t bin_len = 0;
-    const uint8_t *bin_data = NULL;
     bson_iter_binary(&it, &subtype, &bin_len, &bin_data);
     if (bin_len >= sizeof server_first) {
-        bson_destroy(&reply);
-        return MONGO_AUTH_ERR_PROTOCOL;
+        ret = MONGO_AUTH_ERR_PROTOCOL;
+        goto done;
     }
     memcpy(server_first, bin_data, bin_len);
     server_first[bin_len] = '\0';
     bson_destroy(&reply);
+    reply_inited = false;
 
     /* RFC 5802 §5.1 reserved-mext: clients that don't understand a leading
      * "m=" attribute MUST treat it as a fatal error. We don't implement any
@@ -408,41 +447,43 @@ static int scram_auth_run(mongo_transport_t *t, const scram_mech_t *mech, const 
      * reserved-mext, but a malicious MITM could.) */
     if (server_first[0] == 'm' && server_first[1] == '=') {
         error("[auth] server sent reserved-mext extension which this client does not implement");
-        return MONGO_AUTH_ERR_PROTOCOL;
+        ret = MONGO_AUTH_ERR_PROTOCOL;
+        goto done;
     }
 
     /* ---- server-first parse: r=<nonce>, s=<base64 salt>, i=<iterations> ---- */
-    char server_nonce[SCRAM_FIELD_MAX];
-    char salt_b64[SCRAM_FIELD_MAX];
-    char iter_str[16];
     if (extract_field(server_first, 'r', server_nonce, sizeof server_nonce) < 0 ||
         extract_field(server_first, 's', salt_b64, sizeof salt_b64) < 0 ||
         extract_field(server_first, 'i', iter_str, sizeof iter_str) < 0) {
         error("[auth] server-first missing required fields");
-        return MONGO_AUTH_ERR_PROTOCOL;
+        ret = MONGO_AUTH_ERR_PROTOCOL;
+        goto done;
     }
     if (strncmp(server_nonce, client_nonce, client_nonce_len) != 0) {
         error("[auth] server nonce does not begin with our client nonce");
-        return MONGO_AUTH_ERR_NONCE_MISMATCH;
+        ret = MONGO_AUTH_ERR_NONCE_MISMATCH;
+        goto done;
     }
     /* RFC 5802 §5.1 mandates that the server append its own random to the
      * client nonce; a server that just echoes our nonce verbatim reduces
      * SCRAM's replay protection. Reject the no-op case explicitly. */
     if (strlen(server_nonce) <= client_nonce_len) {
         error("[auth] server nonce has no server-side random component");
-        return MONGO_AUTH_ERR_NONCE_MISMATCH;
+        ret = MONGO_AUTH_ERR_NONCE_MISMATCH;
+        goto done;
     }
     long iterations = strtol(iter_str, NULL, 10);
     if (iterations < SCRAM_MIN_ITERATIONS || iterations > SCRAM_MAX_ITERATIONS) {
         error("[auth] server iteration count %ld out of bounds [%d, %d]", iterations, SCRAM_MIN_ITERATIONS,
               SCRAM_MAX_ITERATIONS);
-        return MONGO_AUTH_ERR_PROTOCOL;
+        ret = MONGO_AUTH_ERR_PROTOCOL;
+        goto done;
     }
 
-    uint8_t salt[64];
     size_t salt_len = 0;
     if (mbedtls_base64_decode(salt, sizeof salt, &salt_len, (const unsigned char *)salt_b64, strlen(salt_b64)) != 0) {
-        return MONGO_AUTH_ERR_PROTOCOL;
+        ret = MONGO_AUTH_ERR_PROTOCOL;
+        goto done;
     }
 
 #if MONGO_SCRAM_DEBUG
@@ -458,13 +499,13 @@ static int scram_auth_run(mongo_transport_t *t, const scram_mech_t *mech, const 
 #endif
 
     /* ---- key derivation ---- */
-    uint8_t salted_password[SCRAM_MAX_KEY_LEN];
     {
         mbedtls_md_context_t md_ctx;
         mbedtls_md_init(&md_ctx);
         if (mbedtls_md_setup(&md_ctx, mbedtls_md_info_from_type(mech->md_type), 1) != 0) {
             mbedtls_md_free(&md_ctx);
-            return MONGO_AUTH_ERR_CRYPTO;
+            ret = MONGO_AUTH_ERR_CRYPTO;
+            goto done;
         }
         int pkr =
             mbedtls_pkcs5_pbkdf2_hmac(&md_ctx, (const unsigned char *)prepped_pw, (size_t)prepped_len, salt, salt_len,
@@ -472,19 +513,18 @@ static int scram_auth_run(mongo_transport_t *t, const scram_mech_t *mech, const 
         mbedtls_md_free(&md_ctx);
         if (pkr != 0) {
             error("[auth] PBKDF2 failed: %d", pkr);
-            return MONGO_AUTH_ERR_CRYPTO;
+            ret = MONGO_AUTH_ERR_CRYPTO;
+            goto done;
         }
     }
 
-    uint8_t client_key[SCRAM_MAX_KEY_LEN];
-    uint8_t stored_key[SCRAM_MAX_KEY_LEN];
-    uint8_t server_key[SCRAM_MAX_KEY_LEN];
     if (hmac_digest(mech->md_type, salted_password, mech->key_len, (const uint8_t *)"Client Key", 10, client_key) !=
             0 ||
         hmac_digest(mech->md_type, salted_password, mech->key_len, (const uint8_t *)"Server Key", 10, server_key) !=
             0 ||
         md_digest(mech->md_type, client_key, mech->key_len, stored_key) != 0) {
-        return MONGO_AUTH_ERR_CRYPTO;
+        ret = MONGO_AUTH_ERR_CRYPTO;
+        goto done;
     }
 
 #if MONGO_SCRAM_DEBUG
@@ -500,19 +540,19 @@ static int scram_auth_run(mongo_transport_t *t, const scram_mech_t *mech, const 
 #endif
 
     /* ---- client-final ---- */
-    char client_final_without_proof[SCRAM_FIELD_MAX];
     int cfwp_len = snprintf(client_final_without_proof, sizeof client_final_without_proof, "c=%s,r=%s",
                             SCRAM_GS2_HEADER_B64, server_nonce);
     if (cfwp_len < 0 || cfwp_len >= (int)sizeof client_final_without_proof) {
-        return MONGO_AUTH_ERR_PROTOCOL;
+        ret = MONGO_AUTH_ERR_PROTOCOL;
+        goto done;
     }
 
-    char auth_message[SCRAM_AUTH_MSG_MAX];
     int am_len = snprintf(auth_message, sizeof auth_message, "%s,%s,%s", client_first_bare, server_first,
                           client_final_without_proof);
     if (am_len < 0 || am_len >= (int)sizeof auth_message) {
         error("[auth] auth_message buffer too small");
-        return MONGO_AUTH_ERR_PROTOCOL;
+        ret = MONGO_AUTH_ERR_PROTOCOL;
+        goto done;
     }
 
 #if MONGO_SCRAM_DEBUG
@@ -520,13 +560,12 @@ static int scram_auth_run(mongo_transport_t *t, const scram_mech_t *mech, const 
     debug("[auth] auth_message='%s'", auth_message);
 #endif
 
-    uint8_t client_signature[SCRAM_MAX_KEY_LEN];
     if (hmac_digest(mech->md_type, stored_key, mech->key_len, (const uint8_t *)auth_message, (size_t)am_len,
                     client_signature) != 0) {
-        return MONGO_AUTH_ERR_CRYPTO;
+        ret = MONGO_AUTH_ERR_CRYPTO;
+        goto done;
     }
 
-    uint8_t client_proof[SCRAM_MAX_KEY_LEN];
     for (size_t i = 0; i < mech->key_len; i++) {
         client_proof[i] = client_key[i] ^ client_signature[i];
     }
@@ -541,101 +580,117 @@ static int scram_auth_run(mongo_transport_t *t, const scram_mech_t *mech, const 
     }
 #endif
 
-    char proof_b64[64];
     size_t proof_b64_len = 0;
     if (mbedtls_base64_encode((unsigned char *)proof_b64, sizeof proof_b64, &proof_b64_len, client_proof,
                               mech->key_len) != 0) {
-        return MONGO_AUTH_ERR_CRYPTO;
+        ret = MONGO_AUTH_ERR_CRYPTO;
+        goto done;
     }
     proof_b64[proof_b64_len] = '\0';
 
-    char client_final[SCRAM_FIELD_MAX * 2];
     int cf_len = snprintf(client_final, sizeof client_final, "%s,p=%s", client_final_without_proof, proof_b64);
     if (cf_len < 0 || cf_len >= (int)sizeof client_final) {
-        return MONGO_AUTH_ERR_PROTOCOL;
+        ret = MONGO_AUTH_ERR_PROTOCOL;
+        goto done;
     }
 
     bson_init(&cmd);
+    cmd_inited = true;
     BSON_APPEND_INT32(&cmd, "saslContinue", 1);
     BSON_APPEND_INT32(&cmd, "conversationId", conversation_id);
     bson_append_binary(&cmd, "payload", 7, BSON_SUBTYPE_BINARY, (const uint8_t *)client_final, (uint32_t)cf_len);
 
     rc = mongo_run_command(t, auth_source, &cmd, &reply, timeout_ms);
     bson_destroy(&cmd);
+    cmd_inited = false;
     if (rc != MONGO_WIRE_OK) {
-        return MONGO_AUTH_ERR_TRANSPORT;
+        ret = MONGO_AUTH_ERR_TRANSPORT;
+        goto done;
     }
+    reply_inited = true;
     if (reply_ok(&reply) < 1.0) {
         log_server_rejection("saslStart/Continue", &reply);
-        bson_destroy(&reply);
-        return MONGO_AUTH_ERR_SERVER_REJECTED;
+        ret = MONGO_AUTH_ERR_SERVER_REJECTED;
+        goto done;
     }
 
-    bool done = false;
+    bool exchange_done = false;
     if (bson_iter_init_find(&it, &reply, "done") && BSON_ITER_HOLDS_BOOL(&it)) {
-        done = bson_iter_bool(&it);
+        exchange_done = bson_iter_bool(&it);
     }
     if (!bson_iter_init_find(&it, &reply, "payload") || !BSON_ITER_HOLDS_BINARY(&it)) {
-        bson_destroy(&reply);
-        return MONGO_AUTH_ERR_PROTOCOL;
+        ret = MONGO_AUTH_ERR_PROTOCOL;
+        goto done;
     }
     bson_iter_binary(&it, &subtype, &bin_len, &bin_data);
     char server_final[SCRAM_FIELD_MAX];
     if (bin_len >= sizeof server_final) {
-        bson_destroy(&reply);
-        return MONGO_AUTH_ERR_PROTOCOL;
+        ret = MONGO_AUTH_ERR_PROTOCOL;
+        goto done;
     }
     memcpy(server_final, bin_data, bin_len);
     server_final[bin_len] = '\0';
     bson_destroy(&reply);
+    reply_inited = false;
 
     /* ---- server signature verification ---- */
     if (strncmp(server_final, "v=", 2) != 0) {
         error("[auth] server-final missing v=");
-        return MONGO_AUTH_ERR_PROTOCOL;
+        ret = MONGO_AUTH_ERR_PROTOCOL;
+        goto done;
     }
 
-    uint8_t expected_sig[SCRAM_MAX_KEY_LEN];
     if (hmac_digest(mech->md_type, server_key, mech->key_len, (const uint8_t *)auth_message, (size_t)am_len,
                     expected_sig) != 0) {
-        return MONGO_AUTH_ERR_CRYPTO;
+        ret = MONGO_AUTH_ERR_CRYPTO;
+        goto done;
     }
 
-    uint8_t actual_sig[64];
     size_t actual_sig_len = 0;
     if (mbedtls_base64_decode(actual_sig, sizeof actual_sig, &actual_sig_len, (const unsigned char *)(server_final + 2),
                               strlen(server_final + 2)) != 0) {
-        return MONGO_AUTH_ERR_PROTOCOL;
+        ret = MONGO_AUTH_ERR_PROTOCOL;
+        goto done;
     }
     /* Constant-time so a hostile server can't probe our timing for info
      * about `expected_sig` (which is HMAC(server_key, auth_message), and
      * server_key is password-derived). */
     if (actual_sig_len != mech->key_len || ct_memcmp(actual_sig, expected_sig, mech->key_len) != 0) {
         error("[auth] server signature mismatch");
-        return MONGO_AUTH_ERR_SERVER_SIG;
+        ret = MONGO_AUTH_ERR_SERVER_SIG;
+        goto done;
     }
 
     /* ---- optional empty saslContinue ---- */
-    if (!done) {
+    if (!exchange_done) {
         bson_init(&cmd);
+        cmd_inited = true;
         BSON_APPEND_INT32(&cmd, "saslContinue", 1);
         BSON_APPEND_INT32(&cmd, "conversationId", conversation_id);
         uint8_t empty = 0;
         bson_append_binary(&cmd, "payload", 7, BSON_SUBTYPE_BINARY, &empty, 0);
         rc = mongo_run_command(t, auth_source, &cmd, &reply, timeout_ms);
         bson_destroy(&cmd);
+        cmd_inited = false;
         if (rc == MONGO_WIRE_OK) {
             bson_destroy(&reply);
+            reply_inited = false;
         }
     }
 
-    /* Defense-in-depth: wipe SCRAM intermediates before returning so a
-     * future memory-disclosure bug or core dump can't read salted_password
-     * (which is password-equivalent for PBKDF2 brute force) or the derived
-     * keys. Error paths after PBKDF2 still leak; see security review H5.
-     * mbedtls_platform_zeroize won't be elided by the optimizer. */
+done:
+    /* Single cleanup path -- runs on every return so a function that bails
+     * partway through never leaves password-derived material on the stack.
+     * mbedtls_platform_zeroize is not elided by the optimizer. */
+    if (cmd_inited) {
+        bson_destroy(&cmd);
+    }
+    if (reply_inited) {
+        bson_destroy(&reply);
+    }
     mbedtls_platform_zeroize(prepped_pw, sizeof prepped_pw);
     mbedtls_platform_zeroize(nonce_raw, sizeof nonce_raw);
+    mbedtls_platform_zeroize(salt, sizeof salt);
     mbedtls_platform_zeroize(salted_password, sizeof salted_password);
     mbedtls_platform_zeroize(client_key, sizeof client_key);
     mbedtls_platform_zeroize(stored_key, sizeof stored_key);
@@ -643,7 +698,8 @@ static int scram_auth_run(mongo_transport_t *t, const scram_mech_t *mech, const 
     mbedtls_platform_zeroize(client_signature, sizeof client_signature);
     mbedtls_platform_zeroize(client_proof, sizeof client_proof);
     mbedtls_platform_zeroize(expected_sig, sizeof expected_sig);
-    return MONGO_AUTH_OK;
+    mbedtls_platform_zeroize(actual_sig, sizeof actual_sig);
+    return ret;
 }
 
 int mongo_authenticate_scram_sha256(mongo_transport_t *t, const char *auth_source, const char *username,
