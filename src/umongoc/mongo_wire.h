@@ -41,3 +41,13 @@ typedef enum {
  * The function blocks for up to `timeout_ms` covering both send and receive.
  */
 int mongo_run_command(mongo_transport_t *t, const char *db, const bson_t *cmd, bson_t *reply_out, uint32_t timeout_ms);
+
+/* Pull `ok` from a command reply. Server returns 1.0 or 1 depending on the
+ * field encoding (double vs int32); both are accepted. Returns 0.0 if `ok` is
+ * missing or non-numeric. */
+double mongo_reply_ok(const bson_t *reply);
+
+/* Log errmsg/code/codeName/writeErrors from a failed command reply at error
+ * level. `phase` prefixes the log line for grepability ("insert", "saslStart").
+ * Safe on replies that don't contain any of those fields. */
+void mongo_log_reply_error(const char *phase, const bson_t *reply);

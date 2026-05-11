@@ -117,13 +117,8 @@ static const scram_mech_t SCRAM_SHA256 = {
     .prep_password = prep_pw_identity,
 };
 
-static double reply_ok(const bson_t *reply) {
-    bson_iter_t it;
-    if (bson_iter_init_find(&it, reply, "ok") && BSON_ITER_HOLDS_NUMBER(&it)) {
-        return bson_iter_as_double(&it);
-    }
-    return 0.0;
-}
+/* Alias to keep diff small. Public version lives in mongo_wire.c. */
+#define reply_ok(reply) mongo_reply_ok(reply)
 
 const char *mongo_auth_status_str(int status) {
     switch (status) {
@@ -152,31 +147,9 @@ const char *mongo_auth_status_str(int status) {
     }
 }
 
-/* Log the server-side error info from a failed reply. Atlas / mongod returns
- * {ok:0, errmsg, code, codeName}; surfacing those is much more useful than
- * a numeric driver code. Safe on replies that don't have these fields. */
-static void log_server_rejection(const char *phase, const bson_t *reply) {
-    bson_iter_t it;
-    const char *errmsg = NULL;
-    int code = 0;
-    const char *codename = NULL;
-
-    if (bson_iter_init_find(&it, reply, "errmsg") && BSON_ITER_HOLDS_UTF8(&it)) {
-        errmsg = bson_iter_utf8(&it, NULL);
-    }
-    if (bson_iter_init_find(&it, reply, "code") && BSON_ITER_HOLDS_INT32(&it)) {
-        code = bson_iter_int32(&it);
-    }
-    if (bson_iter_init_find(&it, reply, "codeName") && BSON_ITER_HOLDS_UTF8(&it)) {
-        codename = bson_iter_utf8(&it, NULL);
-    }
-    if (errmsg || code != 0 || codename) {
-        error("[auth] %s rejected: code=%d codeName=%s errmsg=%s", phase, code, codename ? codename : "(none)",
-              errmsg ? errmsg : "(none)");
-    } else {
-        error("[auth] %s rejected (no errmsg in reply)", phase);
-    }
-}
+/* Defer to the public reply-error logger so auth and CRUD ops share one
+ * format. */
+#define log_server_rejection(phase, reply) mongo_log_reply_error(phase, reply)
 
 int mongo_handshake(mongo_transport_t *t, const char *app_name, const char *board_name, const char *sasl_user_db,
                     bson_t *reply_out, uint32_t timeout_ms) {
@@ -623,4 +596,49 @@ int mongo_authenticate_scram_sha256(mongo_transport_t *t, const char *auth_sourc
 int mongo_authenticate_scram_sha1(mongo_transport_t *t, const char *auth_source, const char *username,
                                   const char *password, uint32_t timeout_ms) {
     return scram_auth_run(t, &SCRAM_SHA1, auth_source, username, password, timeout_ms);
+}
+
+int mongo_authenticate(mongo_transport_t *t, const bson_t *hello_reply, const char *auth_source, const char *username,
+                       const char *password, uint32_t timeout_ms) {
+    if (!t || !auth_source || !username || !password) {
+        return MONGO_AUTH_ERR_ARGS;
+    }
+
+    bool has_sha256 = false;
+    bool has_sha1 = false;
+    bool have_mechs_list = false;
+
+    bson_iter_t it;
+    if (hello_reply && bson_iter_init_find(&it, hello_reply, "saslSupportedMechs") && BSON_ITER_HOLDS_ARRAY(&it)) {
+        bson_iter_t arr;
+        if (bson_iter_recurse(&it, &arr)) {
+            have_mechs_list = true;
+            while (bson_iter_next(&arr) && BSON_ITER_HOLDS_UTF8(&arr)) {
+                const char *m = bson_iter_utf8(&arr, NULL);
+                if (strcmp(m, "SCRAM-SHA-256") == 0) {
+                    has_sha256 = true;
+                } else if (strcmp(m, "SCRAM-SHA-1") == 0) {
+                    has_sha1 = true;
+                }
+            }
+        }
+    }
+
+    /* If the hello reply didn't include saslSupportedMechs (caller didn't ask
+     * for it, or the server is old), prefer SHA-256 -- a SHA-256-only server
+     * will accept it, and a SHA-1-only server will tell us so via the
+     * SERVER_REJECTED that comes back. */
+    if (!have_mechs_list) {
+        has_sha256 = true;
+    }
+
+    if (has_sha256) {
+        return scram_auth_run(t, &SCRAM_SHA256, auth_source, username, password, timeout_ms);
+    }
+    if (has_sha1) {
+        warning("[auth] server only stores SCRAM-SHA-1 for this user; using legacy mechanism");
+        return scram_auth_run(t, &SCRAM_SHA1, auth_source, username, password, timeout_ms);
+    }
+    error("[auth] no SCRAM mechanism available for %s.%s", auth_source, username);
+    return MONGO_AUTH_ERR_PROTOCOL;
 }

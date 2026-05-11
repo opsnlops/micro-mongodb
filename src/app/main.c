@@ -60,14 +60,8 @@
 #define TIMED_BEGIN(name) absolute_time_t _t_##name = get_absolute_time()
 #define TIMED_US(name) ((int)absolute_time_diff_us(_t_##name, get_absolute_time()))
 
-/* Pull a numeric `ok` from a reply doc. Server returns 1.0 or 1, depending. */
-static double reply_ok(const bson_t *reply) {
-    bson_iter_t it;
-    if (bson_iter_init_find(&it, reply, "ok") && BSON_ITER_HOLDS_NUMBER(&it)) {
-        return bson_iter_as_double(&it);
-    }
-    return 0.0;
-}
+/* reply_ok lives in umongoc now (mongo_wire.c). */
+#define reply_ok(reply) mongo_reply_ok(reply)
 
 static int run_ping(mongo_transport_t *t, int *us_out) {
     bson_t cmd;
@@ -112,10 +106,15 @@ static int run_smoke_test(mongo_transport_t *t) {
     rc = mongo_insert_one(t, TEST_DB, TEST_COLL, &doc, &reply, CMD_TIMEOUT_MS);
     t_insert = TIMED_US(insert);
     bson_destroy(&doc);
-    if (rc != MONGO_WIRE_OK || reply_ok(&reply) < 1.0) {
-        error("insert: rc=%d ok=%.0f", rc, reply_ok(&reply));
+    if (rc != MONGO_WIRE_OK) {
+        error("insert: transport rc=%d", rc);
         bson_destroy(&reply);
-        return rc != MONGO_WIRE_OK ? rc : MONGO_WIRE_ERR_PROTOCOL;
+        return rc;
+    }
+    if (reply_ok(&reply) < 1.0) {
+        mongo_log_reply_error("insert", &reply);
+        bson_destroy(&reply);
+        return MONGO_WIRE_ERR_PROTOCOL;
     }
     bson_destroy(&reply);
     info("insert ok tag=%lld (%d us)", (long long)tag, t_insert);
@@ -169,10 +168,15 @@ static int run_smoke_test(mongo_transport_t *t) {
     t_update = TIMED_US(update);
     bson_destroy(&up_filter);
     bson_destroy(&up_spec);
-    if (rc != MONGO_WIRE_OK || reply_ok(&reply) < 1.0) {
-        error("update: rc=%d ok=%.0f", rc, reply_ok(&reply));
+    if (rc != MONGO_WIRE_OK) {
+        error("update: transport rc=%d", rc);
         bson_destroy(&reply);
-        return rc != MONGO_WIRE_OK ? rc : MONGO_WIRE_ERR_PROTOCOL;
+        return rc;
+    }
+    if (reply_ok(&reply) < 1.0) {
+        mongo_log_reply_error("update", &reply);
+        bson_destroy(&reply);
+        return MONGO_WIRE_ERR_PROTOCOL;
     }
     bson_destroy(&reply);
     info("update ok (%d us)", t_update);
@@ -186,10 +190,15 @@ static int run_smoke_test(mongo_transport_t *t) {
     rc = mongo_delete_one(t, TEST_DB, TEST_COLL, &del_filter, &reply, CMD_TIMEOUT_MS);
     t_delete = TIMED_US(del);
     bson_destroy(&del_filter);
-    if (rc != MONGO_WIRE_OK || reply_ok(&reply) < 1.0) {
-        error("delete: rc=%d ok=%.0f", rc, reply_ok(&reply));
+    if (rc != MONGO_WIRE_OK) {
+        error("delete: transport rc=%d", rc);
         bson_destroy(&reply);
-        return rc != MONGO_WIRE_OK ? rc : MONGO_WIRE_ERR_PROTOCOL;
+        return rc;
+    }
+    if (reply_ok(&reply) < 1.0) {
+        mongo_log_reply_error("delete", &reply);
+        bson_destroy(&reply);
+        return MONGO_WIRE_ERR_PROTOCOL;
     }
     bson_destroy(&reply);
     info("delete ok (%d us)", t_delete);
@@ -292,59 +301,25 @@ static void network_task(void *arg) {
             vTaskDelay(pdMS_TO_TICKS(5000));
             continue;
         }
-        bson_destroy(&hello_reply);
         info("hello ok (%d us)", t_hello);
 
-        /* SCRAM if credentials are configured. Prefer SHA-256, fall back to
-         * SHA-1 if that's all the user has stored on the server side. */
+        /* SCRAM if credentials are configured. The driver picks SHA-256 or
+         * SHA-1 based on the hello reply's saslSupportedMechs. */
         int t_scram = 0;
         if (uri.username[0] && uri.password[0]) {
-            bool has_sha256 = false;
-            bool has_sha1 = false;
-            bson_iter_t mit;
-            if (bson_iter_init_find(&mit, &hello_reply, "saslSupportedMechs") && BSON_ITER_HOLDS_ARRAY(&mit)) {
-                bson_iter_t arr;
-                if (bson_iter_recurse(&mit, &arr)) {
-                    while (bson_iter_next(&arr) && BSON_ITER_HOLDS_UTF8(&arr)) {
-                        const char *m = bson_iter_utf8(&arr, NULL);
-                        if (strcmp(m, "SCRAM-SHA-256") == 0) {
-                            has_sha256 = true;
-                        } else if (strcmp(m, "SCRAM-SHA-1") == 0) {
-                            has_sha1 = true;
-                        }
-                    }
-                }
-            } else {
-                /* hello didn't return saslSupportedMechs (unusual); default
-                 * to trying SHA-256 first. */
-                has_sha256 = true;
-            }
-
-            int arc;
-            const char *mech_used;
             TIMED_BEGIN(scram);
-            if (has_sha256) {
-                mech_used = "SCRAM-SHA-256";
-                arc = mongo_authenticate_scram_sha256(t, uri.auth_source, uri.username, uri.password, CMD_TIMEOUT_MS);
-            } else if (has_sha1) {
-                mech_used = "SCRAM-SHA-1";
-                warning("server only stores SCRAM-SHA-1 for this user; falling back");
-                arc = mongo_authenticate_scram_sha1(t, uri.auth_source, uri.username, uri.password, CMD_TIMEOUT_MS);
-            } else {
-                error("server reports no SCRAM mechanism available for %s.%s", uri.auth_source, uri.username);
-                mongo_transport_close(t);
-                vTaskDelay(pdMS_TO_TICKS(5000));
-                continue;
-            }
+            int arc = mongo_authenticate(t, &hello_reply, uri.auth_source, uri.username, uri.password, CMD_TIMEOUT_MS);
             t_scram = TIMED_US(scram);
             if (arc != MONGO_AUTH_OK) {
-                error("scram failed: %s (mech=%s rc=%d, %d us)", mongo_auth_status_str(arc), mech_used, arc, t_scram);
+                error("scram failed: %s (rc=%d, %d us)", mongo_auth_status_str(arc), arc, t_scram);
+                bson_destroy(&hello_reply);
                 mongo_transport_close(t);
                 vTaskDelay(pdMS_TO_TICKS(5000));
                 continue;
             }
-            info("scram ok (mech=%s, %d us)", mech_used, t_scram);
+            info("scram ok (%d us)", t_scram);
         }
+        bson_destroy(&hello_reply);
 
         info("running smoke test");
         rc = run_smoke_test(t);

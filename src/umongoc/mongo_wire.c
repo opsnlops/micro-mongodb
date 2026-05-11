@@ -173,3 +173,75 @@ int mongo_run_command(mongo_transport_t *t, const char *db, const bson_t *cmd, b
     }
     return recv_op_msg(t, request_id, reply_out, timeout_ms);
 }
+
+double mongo_reply_ok(const bson_t *reply) {
+    if (!reply) {
+        return 0.0;
+    }
+    bson_iter_t it;
+    if (bson_iter_init_find(&it, reply, "ok") && BSON_ITER_HOLDS_NUMBER(&it)) {
+        return bson_iter_as_double(&it);
+    }
+    return 0.0;
+}
+
+/* Format the first write-error from a reply's `writeErrors` array, if present,
+ * into `buf`. Atlas returns these for per-document insert/update/delete
+ * failures (e.g. a permissions issue, schema validation, duplicate key). */
+static void format_first_write_error(const bson_t *reply, char *buf, size_t buf_sz) {
+    buf[0] = '\0';
+    bson_iter_t it;
+    if (!bson_iter_init_find(&it, reply, "writeErrors") || !BSON_ITER_HOLDS_ARRAY(&it)) {
+        return;
+    }
+    bson_iter_t arr;
+    if (!bson_iter_recurse(&it, &arr) || !bson_iter_next(&arr) || !BSON_ITER_HOLDS_DOCUMENT(&arr)) {
+        return;
+    }
+    bson_iter_t doc;
+    if (!bson_iter_recurse(&arr, &doc)) {
+        return;
+    }
+    int we_code = 0;
+    const char *we_msg = NULL;
+    while (bson_iter_next(&doc)) {
+        const char *key = bson_iter_key(&doc);
+        if (strcmp(key, "code") == 0 && BSON_ITER_HOLDS_INT32(&doc)) {
+            we_code = bson_iter_int32(&doc);
+        } else if (strcmp(key, "errmsg") == 0 && BSON_ITER_HOLDS_UTF8(&doc)) {
+            we_msg = bson_iter_utf8(&doc, NULL);
+        }
+    }
+    snprintf(buf, buf_sz, " writeError[0]={code=%d, errmsg=%s}", we_code, we_msg ? we_msg : "(none)");
+}
+
+void mongo_log_reply_error(const char *phase, const bson_t *reply) {
+    if (!reply) {
+        error("[mongo] %s rejected (no reply)", phase ? phase : "?");
+        return;
+    }
+    bson_iter_t it;
+    const char *errmsg = NULL;
+    int code = 0;
+    const char *codename = NULL;
+
+    if (bson_iter_init_find(&it, reply, "errmsg") && BSON_ITER_HOLDS_UTF8(&it)) {
+        errmsg = bson_iter_utf8(&it, NULL);
+    }
+    if (bson_iter_init_find(&it, reply, "code") && BSON_ITER_HOLDS_INT32(&it)) {
+        code = bson_iter_int32(&it);
+    }
+    if (bson_iter_init_find(&it, reply, "codeName") && BSON_ITER_HOLDS_UTF8(&it)) {
+        codename = bson_iter_utf8(&it, NULL);
+    }
+
+    char we_buf[256];
+    format_first_write_error(reply, we_buf, sizeof we_buf);
+
+    if (errmsg || code != 0 || codename || we_buf[0]) {
+        error("[mongo] %s rejected: code=%d codeName=%s errmsg=%s%s", phase ? phase : "?", code,
+              codename ? codename : "(none)", errmsg ? errmsg : "(none)", we_buf);
+    } else {
+        error("[mongo] %s rejected (no errmsg/code/writeErrors in reply)", phase ? phase : "?");
+    }
+}

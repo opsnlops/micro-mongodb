@@ -73,6 +73,15 @@ int mongo_authenticate_scram_sha256(mongo_transport_t *t, const char *auth_sourc
 int mongo_authenticate_scram_sha1(mongo_transport_t *t, const char *auth_source, const char *username,
                                   const char *password, uint32_t timeout_ms);
 
+/* Convenience: choose the right SCRAM mechanism based on the saslSupportedMechs
+ * array in `hello_reply` (which mongo_handshake() populates when called with a
+ * non-NULL sasl_user_db) and run it. Prefers SCRAM-SHA-256; falls back to
+ * SCRAM-SHA-1 with a warning log line if that's all the user has stored. If
+ * saslSupportedMechs is absent, defaults to SCRAM-SHA-256. Returns
+ * MONGO_AUTH_ERR_PROTOCOL if the user has no SCRAM mechanism enabled. */
+int mongo_authenticate(mongo_transport_t *t, const bson_t *hello_reply, const char *auth_source, const char *username,
+                       const char *password, uint32_t timeout_ms);
+
 #ifdef __cplusplus
 }
 #endif
