@@ -1,0 +1,12 @@
+build/
+cmake-build-*/
+.cache/
+.idea/
+.vscode/
+*.uf2
+*.elf
+*.bin
+*.hex
+*.dis
+*.map
+compile_commands.json

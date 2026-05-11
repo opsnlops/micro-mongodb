@@ -1,0 +1,5 @@
+# The libbson sources under this directory are vendored from mongo-c-driver
+# 1.28.0; we keep them in their upstream style so diffs against upstream stay
+# legible. Disable clang-format here so a recursive run doesn't rewrite them.
+DisableFormat: true
+SortIncludes: false
