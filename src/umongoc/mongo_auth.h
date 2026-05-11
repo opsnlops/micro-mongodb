@@ -63,6 +63,16 @@ int mongo_handshake(mongo_transport_t *t, const char *app_name, const char *boar
 int mongo_authenticate_scram_sha256(mongo_transport_t *t, const char *auth_source, const char *username,
                                     const char *password, uint32_t timeout_ms);
 
+/* Run SCRAM-SHA-1. Same flow as -SHA-256 but with SHA-1/HMAC-SHA-1 throughout
+ * and the MongoDB-CR legacy password derivation:
+ *     pbkdf2_input = hex(md5(username + ":mongo:" + password))
+ * Atlas users created in the UI sometimes only have SHA-1 credentials stored
+ * (run mongo_handshake() with a non-NULL `sasl_user_db` to discover which
+ * mechanisms a user actually supports). SHA-1 is deprecated in newer MongoDB
+ * but still widely deployed. */
+int mongo_authenticate_scram_sha1(mongo_transport_t *t, const char *auth_source, const char *username,
+                                  const char *password, uint32_t timeout_ms);
+
 #ifdef __cplusplus
 }
 #endif

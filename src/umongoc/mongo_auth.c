@@ -8,14 +8,17 @@
 
 #include "mbedtls/base64.h"
 #include "mbedtls/md.h"
+#include "mbedtls/md5.h"
 #include "mbedtls/pkcs5.h"
+#include "mbedtls/sha1.h"
 #include "mbedtls/sha256.h"
 
 #include "logging.h"
 #include "mongo_wire.h"
 
-/* TEMP: detailed SCRAM diagnostic logging. Leaks salted-password-derived
- * material to the log, so set back to 0 once auth is working. */
+/* Detailed SCRAM diagnostic logging. Leaks salted-password-derived material
+ * to the log, so set to 0 (the default once we've debugged auth) for normal
+ * operation. Re-enable with -DMONGO_SCRAM_DEBUG=1 at the CMake level. */
 #ifndef MONGO_SCRAM_DEBUG
 #define MONGO_SCRAM_DEBUG 1
 #endif
@@ -39,12 +42,80 @@ static void hexify(const uint8_t *bytes, size_t n, char *out, size_t out_sz) {
 
 #define SCRAM_NONCE_RAW 24 /* spec: 24 random bytes per server-side */
 #define SCRAM_NONCE_B64 ((SCRAM_NONCE_RAW + 2) / 3 * 4 + 1)
-#define SCRAM_KEY_LEN 32 /* SHA-256 output */
+#define SCRAM_MAX_KEY_LEN 32 /* SHA-256 output; SHA-1 only needs 20 */
 #define SCRAM_MIN_ITERATIONS 4096
 #define SCRAM_AUTH_MSG_MAX 1024
 #define SCRAM_FIELD_MAX 256
 #define SCRAM_GS2_HEADER "n,,"
 #define SCRAM_GS2_HEADER_B64 "biws" /* base64("n,,") */
+
+/* Per-mechanism configuration. Parameterizes the otherwise-identical SCRAM
+ * exchange across SCRAM-SHA-1 and SCRAM-SHA-256. */
+typedef struct {
+    mbedtls_md_type_t md_type;
+    size_t key_len; /* hash output size: 20 for SHA-1, 32 for SHA-256 */
+    const char *mechanism;
+    /* Prepare the password input to PBKDF2. For SHA-256 this is identity;
+     * for SHA-1 it's MongoDB's legacy hex(md5(user+":mongo:"+pw)) derivation.
+     * Returns the length written to `out` (excl. NUL), or -1 on error. */
+    int (*prep_password)(const char *username, const char *password, char *out, size_t out_sz);
+} scram_mech_t;
+
+static int prep_pw_identity(const char *username, const char *password, char *out, size_t out_sz) {
+    (void)username;
+    size_t n = strlen(password);
+    if (n + 1 > out_sz) {
+        return -1;
+    }
+    memcpy(out, password, n);
+    out[n] = '\0';
+    return (int)n;
+}
+
+/* MongoDB SCRAM-SHA-1 derives the PBKDF2 input via the same MONGODB-CR step:
+ *     md5(username + ":mongo:" + password)
+ * encoded as 32 lowercase hex characters. */
+static int prep_pw_mongodb_cr(const char *username, const char *password, char *out, size_t out_sz) {
+    if (out_sz < 33) {
+        return -1;
+    }
+    mbedtls_md5_context ctx;
+    mbedtls_md5_init(&ctx);
+    if (mbedtls_md5_starts(&ctx) != 0 ||
+        mbedtls_md5_update(&ctx, (const unsigned char *)username, strlen(username)) != 0 ||
+        mbedtls_md5_update(&ctx, (const unsigned char *)":mongo:", 7) != 0 ||
+        mbedtls_md5_update(&ctx, (const unsigned char *)password, strlen(password)) != 0) {
+        mbedtls_md5_free(&ctx);
+        return -1;
+    }
+    uint8_t digest[16];
+    int rc = mbedtls_md5_finish(&ctx, digest);
+    mbedtls_md5_free(&ctx);
+    if (rc != 0) {
+        return -1;
+    }
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < 16; i++) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[i * 2 + 1] = hex[digest[i] & 0xf];
+    }
+    out[32] = '\0';
+    return 32;
+}
+
+static const scram_mech_t SCRAM_SHA1 = {
+    .md_type = MBEDTLS_MD_SHA1,
+    .key_len = 20,
+    .mechanism = "SCRAM-SHA-1",
+    .prep_password = prep_pw_mongodb_cr,
+};
+
+static const scram_mech_t SCRAM_SHA256 = {
+    .md_type = MBEDTLS_MD_SHA256,
+    .key_len = SCRAM_MAX_KEY_LEN,
+    .mechanism = "SCRAM-SHA-256",
+    .prep_password = prep_pw_identity,
+};
 
 static double reply_ok(const bson_t *reply) {
     bson_iter_t it;
@@ -160,8 +231,7 @@ int mongo_handshake(mongo_transport_t *t, const char *app_name, const char *boar
         return MONGO_AUTH_ERR_SERVER_REJECTED;
     }
 
-    /* Surface the saslSupportedMechs the server reported -- this tells us
-     * directly which auth mechanisms are configured for this specific user. */
+    /* Surface the saslSupportedMechs the server reported. */
     bson_iter_t it;
     if (sasl_user_db && bson_iter_init_find(&it, reply_out, "saslSupportedMechs") && BSON_ITER_HOLDS_ARRAY(&it)) {
         bson_iter_t arr;
@@ -207,13 +277,23 @@ static int extract_field(const char *payload, char key, char *out, size_t out_sz
     return -1;
 }
 
-/* Wrap mbedTLS one-shot HMAC-SHA-256 with a tidy error path. */
-static int hmac_sha256(const uint8_t *key, size_t key_len, const uint8_t *msg, size_t msg_len, uint8_t out[32]) {
-    const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+/* One-shot HMAC using the mechanism's hash. */
+static int hmac_digest(mbedtls_md_type_t md_type, const uint8_t *key, size_t key_len, const uint8_t *msg,
+                       size_t msg_len, uint8_t *out) {
+    const mbedtls_md_info_t *info = mbedtls_md_info_from_type(md_type);
     if (!info) {
         return -1;
     }
     return mbedtls_md_hmac(info, key, key_len, msg, msg_len, out);
+}
+
+/* One-shot hash using the mechanism's hash. */
+static int md_digest(mbedtls_md_type_t md_type, const uint8_t *msg, size_t msg_len, uint8_t *out) {
+    const mbedtls_md_info_t *info = mbedtls_md_info_from_type(md_type);
+    if (!info) {
+        return -1;
+    }
+    return mbedtls_md(info, msg, msg_len, out);
 }
 
 /* Fill `buf` with `n` cryptographically random bytes using pico_rand. */
@@ -230,9 +310,9 @@ static void rand_bytes(uint8_t *buf, size_t n) {
     }
 }
 
-int mongo_authenticate_scram_sha256(mongo_transport_t *t, const char *auth_source, const char *username,
-                                    const char *password, uint32_t timeout_ms) {
-    if (!t || !auth_source || !username || !password) {
+static int scram_auth_run(mongo_transport_t *t, const scram_mech_t *mech, const char *auth_source, const char *username,
+                          const char *password, uint32_t timeout_ms) {
+    if (!t || !mech || !auth_source || !username || !password) {
         return MONGO_AUTH_ERR_ARGS;
     }
 
@@ -244,10 +324,15 @@ int mongo_authenticate_scram_sha256(mongo_transport_t *t, const char *auth_sourc
         }
     }
 
-    /* Diagnostic line: shows what we're going to send without revealing the
-     * password. Critical for telling apart "wrong creds" from "wrong URI
-     * parsing" (Atlas's "bad auth" reply is the same in both cases). */
-    debug("[auth] SCRAM user='%s' authSource='%s' pw_len=%u", username, auth_source, (unsigned)strlen(password));
+    debug("[auth] %s user='%s' authSource='%s' pw_len=%u", mech->mechanism, username, auth_source,
+          (unsigned)strlen(password));
+
+    /* Mechanism-specific password preprocessing. */
+    char prepped_pw[64];
+    int prepped_len = mech->prep_password(username, password, prepped_pw, sizeof prepped_pw);
+    if (prepped_len < 0) {
+        return MONGO_AUTH_ERR_CRYPTO;
+    }
 
     /* ---- client-first ---- */
     uint8_t nonce_raw[SCRAM_NONCE_RAW];
@@ -276,7 +361,7 @@ int mongo_authenticate_scram_sha256(mongo_transport_t *t, const char *auth_sourc
     bson_t cmd;
     bson_init(&cmd);
     BSON_APPEND_INT32(&cmd, "saslStart", 1);
-    BSON_APPEND_UTF8(&cmd, "mechanism", "SCRAM-SHA-256");
+    BSON_APPEND_UTF8(&cmd, "mechanism", mech->mechanism);
     bson_append_binary(&cmd, "payload", 7, BSON_SUBTYPE_BINARY, (const uint8_t *)client_first_msg, (uint32_t)cfm_len);
     /* skipEmptyExchange asks the server to set done=true on the saslContinue
      * reply rather than expecting a final empty round-trip. */
@@ -336,7 +421,7 @@ int mongo_authenticate_scram_sha256(mongo_transport_t *t, const char *auth_sourc
     }
     long iterations = strtol(iter_str, NULL, 10);
     if (iterations < SCRAM_MIN_ITERATIONS) {
-        error("[auth] server iteration count %ld below SCRAM-SHA-256 floor", iterations);
+        error("[auth] server iteration count %ld below SCRAM floor", iterations);
         return MONGO_AUTH_ERR_PROTOCOL;
     }
 
@@ -359,16 +444,17 @@ int mongo_authenticate_scram_sha256(mongo_transport_t *t, const char *auth_sourc
 #endif
 
     /* ---- key derivation ---- */
-    uint8_t salted_password[SCRAM_KEY_LEN];
+    uint8_t salted_password[SCRAM_MAX_KEY_LEN];
     {
         mbedtls_md_context_t md_ctx;
         mbedtls_md_init(&md_ctx);
-        if (mbedtls_md_setup(&md_ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1) != 0) {
+        if (mbedtls_md_setup(&md_ctx, mbedtls_md_info_from_type(mech->md_type), 1) != 0) {
             mbedtls_md_free(&md_ctx);
             return MONGO_AUTH_ERR_CRYPTO;
         }
-        int pkr = mbedtls_pkcs5_pbkdf2_hmac(&md_ctx, (const unsigned char *)password, strlen(password), salt, salt_len,
-                                            (unsigned int)iterations, SCRAM_KEY_LEN, salted_password);
+        int pkr =
+            mbedtls_pkcs5_pbkdf2_hmac(&md_ctx, (const unsigned char *)prepped_pw, (size_t)prepped_len, salt, salt_len,
+                                      (unsigned int)iterations, (uint32_t)mech->key_len, salted_password);
         mbedtls_md_free(&md_ctx);
         if (pkr != 0) {
             error("[auth] PBKDF2 failed: %d", pkr);
@@ -376,23 +462,25 @@ int mongo_authenticate_scram_sha256(mongo_transport_t *t, const char *auth_sourc
         }
     }
 
-    uint8_t client_key[SCRAM_KEY_LEN];
-    uint8_t stored_key[SCRAM_KEY_LEN];
-    uint8_t server_key[SCRAM_KEY_LEN];
-    if (hmac_sha256(salted_password, SCRAM_KEY_LEN, (const uint8_t *)"Client Key", 10, client_key) != 0 ||
-        hmac_sha256(salted_password, SCRAM_KEY_LEN, (const uint8_t *)"Server Key", 10, server_key) != 0 ||
-        mbedtls_sha256(client_key, SCRAM_KEY_LEN, stored_key, 0) != 0) {
+    uint8_t client_key[SCRAM_MAX_KEY_LEN];
+    uint8_t stored_key[SCRAM_MAX_KEY_LEN];
+    uint8_t server_key[SCRAM_MAX_KEY_LEN];
+    if (hmac_digest(mech->md_type, salted_password, mech->key_len, (const uint8_t *)"Client Key", 10, client_key) !=
+            0 ||
+        hmac_digest(mech->md_type, salted_password, mech->key_len, (const uint8_t *)"Server Key", 10, server_key) !=
+            0 ||
+        md_digest(mech->md_type, client_key, mech->key_len, stored_key) != 0) {
         return MONGO_AUTH_ERR_CRYPTO;
     }
 
 #if MONGO_SCRAM_DEBUG
     {
-        char hex[2 * SCRAM_KEY_LEN + 1];
-        hexify(salted_password, SCRAM_KEY_LEN, hex, sizeof hex);
+        char hex[2 * SCRAM_MAX_KEY_LEN + 1];
+        hexify(salted_password, mech->key_len, hex, sizeof hex);
         debug("[auth] salted_password=%s", hex);
-        hexify(client_key, SCRAM_KEY_LEN, hex, sizeof hex);
+        hexify(client_key, mech->key_len, hex, sizeof hex);
         debug("[auth] client_key=%s", hex);
-        hexify(stored_key, SCRAM_KEY_LEN, hex, sizeof hex);
+        hexify(stored_key, mech->key_len, hex, sizeof hex);
         debug("[auth] stored_key=%s", hex);
     }
 #endif
@@ -418,22 +506,23 @@ int mongo_authenticate_scram_sha256(mongo_transport_t *t, const char *auth_sourc
     debug("[auth] auth_message='%s'", auth_message);
 #endif
 
-    uint8_t client_signature[SCRAM_KEY_LEN];
-    if (hmac_sha256(stored_key, SCRAM_KEY_LEN, (const uint8_t *)auth_message, (size_t)am_len, client_signature) != 0) {
+    uint8_t client_signature[SCRAM_MAX_KEY_LEN];
+    if (hmac_digest(mech->md_type, stored_key, mech->key_len, (const uint8_t *)auth_message, (size_t)am_len,
+                    client_signature) != 0) {
         return MONGO_AUTH_ERR_CRYPTO;
     }
 
-    uint8_t client_proof[SCRAM_KEY_LEN];
-    for (int i = 0; i < SCRAM_KEY_LEN; i++) {
+    uint8_t client_proof[SCRAM_MAX_KEY_LEN];
+    for (size_t i = 0; i < mech->key_len; i++) {
         client_proof[i] = client_key[i] ^ client_signature[i];
     }
 
 #if MONGO_SCRAM_DEBUG
     {
-        char hex[2 * SCRAM_KEY_LEN + 1];
-        hexify(client_signature, SCRAM_KEY_LEN, hex, sizeof hex);
+        char hex[2 * SCRAM_MAX_KEY_LEN + 1];
+        hexify(client_signature, mech->key_len, hex, sizeof hex);
         debug("[auth] client_signature=%s", hex);
-        hexify(client_proof, SCRAM_KEY_LEN, hex, sizeof hex);
+        hexify(client_proof, mech->key_len, hex, sizeof hex);
         debug("[auth] client_proof=%s", hex);
     }
 #endif
@@ -441,7 +530,7 @@ int mongo_authenticate_scram_sha256(mongo_transport_t *t, const char *auth_sourc
     char proof_b64[64];
     size_t proof_b64_len = 0;
     if (mbedtls_base64_encode((unsigned char *)proof_b64, sizeof proof_b64, &proof_b64_len, client_proof,
-                              SCRAM_KEY_LEN) != 0) {
+                              mech->key_len) != 0) {
         return MONGO_AUTH_ERR_CRYPTO;
     }
     proof_b64[proof_b64_len] = '\0';
@@ -492,8 +581,9 @@ int mongo_authenticate_scram_sha256(mongo_transport_t *t, const char *auth_sourc
         return MONGO_AUTH_ERR_PROTOCOL;
     }
 
-    uint8_t expected_sig[SCRAM_KEY_LEN];
-    if (hmac_sha256(server_key, SCRAM_KEY_LEN, (const uint8_t *)auth_message, (size_t)am_len, expected_sig) != 0) {
+    uint8_t expected_sig[SCRAM_MAX_KEY_LEN];
+    if (hmac_digest(mech->md_type, server_key, mech->key_len, (const uint8_t *)auth_message, (size_t)am_len,
+                    expected_sig) != 0) {
         return MONGO_AUTH_ERR_CRYPTO;
     }
 
@@ -503,7 +593,7 @@ int mongo_authenticate_scram_sha256(mongo_transport_t *t, const char *auth_sourc
                               strlen(server_final + 2)) != 0) {
         return MONGO_AUTH_ERR_PROTOCOL;
     }
-    if (actual_sig_len != SCRAM_KEY_LEN || memcmp(actual_sig, expected_sig, SCRAM_KEY_LEN) != 0) {
+    if (actual_sig_len != mech->key_len || memcmp(actual_sig, expected_sig, mech->key_len) != 0) {
         error("[auth] server signature mismatch");
         return MONGO_AUTH_ERR_SERVER_SIG;
     }
@@ -523,4 +613,14 @@ int mongo_authenticate_scram_sha256(mongo_transport_t *t, const char *auth_sourc
     }
 
     return MONGO_AUTH_OK;
+}
+
+int mongo_authenticate_scram_sha256(mongo_transport_t *t, const char *auth_source, const char *username,
+                                    const char *password, uint32_t timeout_ms) {
+    return scram_auth_run(t, &SCRAM_SHA256, auth_source, username, password, timeout_ms);
+}
+
+int mongo_authenticate_scram_sha1(mongo_transport_t *t, const char *auth_source, const char *username,
+                                  const char *password, uint32_t timeout_ms) {
+    return scram_auth_run(t, &SCRAM_SHA1, auth_source, username, password, timeout_ms);
 }

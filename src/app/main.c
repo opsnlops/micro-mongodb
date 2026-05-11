@@ -295,19 +295,55 @@ static void network_task(void *arg) {
         bson_destroy(&hello_reply);
         info("hello ok (%d us)", t_hello);
 
-        /* SCRAM if credentials are configured. */
+        /* SCRAM if credentials are configured. Prefer SHA-256, fall back to
+         * SHA-1 if that's all the user has stored on the server side. */
         int t_scram = 0;
         if (uri.username[0] && uri.password[0]) {
+            bool has_sha256 = false;
+            bool has_sha1 = false;
+            bson_iter_t mit;
+            if (bson_iter_init_find(&mit, &hello_reply, "saslSupportedMechs") && BSON_ITER_HOLDS_ARRAY(&mit)) {
+                bson_iter_t arr;
+                if (bson_iter_recurse(&mit, &arr)) {
+                    while (bson_iter_next(&arr) && BSON_ITER_HOLDS_UTF8(&arr)) {
+                        const char *m = bson_iter_utf8(&arr, NULL);
+                        if (strcmp(m, "SCRAM-SHA-256") == 0) {
+                            has_sha256 = true;
+                        } else if (strcmp(m, "SCRAM-SHA-1") == 0) {
+                            has_sha1 = true;
+                        }
+                    }
+                }
+            } else {
+                /* hello didn't return saslSupportedMechs (unusual); default
+                 * to trying SHA-256 first. */
+                has_sha256 = true;
+            }
+
+            int arc;
+            const char *mech_used;
             TIMED_BEGIN(scram);
-            int arc = mongo_authenticate_scram_sha256(t, uri.auth_source, uri.username, uri.password, CMD_TIMEOUT_MS);
-            t_scram = TIMED_US(scram);
-            if (arc != MONGO_AUTH_OK) {
-                error("scram failed: %s (rc=%d, %d us)", mongo_auth_status_str(arc), arc, t_scram);
+            if (has_sha256) {
+                mech_used = "SCRAM-SHA-256";
+                arc = mongo_authenticate_scram_sha256(t, uri.auth_source, uri.username, uri.password, CMD_TIMEOUT_MS);
+            } else if (has_sha1) {
+                mech_used = "SCRAM-SHA-1";
+                warning("server only stores SCRAM-SHA-1 for this user; falling back");
+                arc = mongo_authenticate_scram_sha1(t, uri.auth_source, uri.username, uri.password, CMD_TIMEOUT_MS);
+            } else {
+                error("server reports no SCRAM mechanism available for %s.%s", uri.auth_source, uri.username);
                 mongo_transport_close(t);
                 vTaskDelay(pdMS_TO_TICKS(5000));
                 continue;
             }
-            info("scram ok (%d us)", t_scram);
+            t_scram = TIMED_US(scram);
+            if (arc != MONGO_AUTH_OK) {
+                error("scram failed: %s (mech=%s rc=%d, %d us)", mongo_auth_status_str(arc), mech_used, arc, t_scram);
+                mongo_transport_close(t);
+                vTaskDelay(pdMS_TO_TICKS(5000));
+                continue;
+            }
+            info("scram ok (mech=%s, %d us)", mech_used, t_scram);
         }
 
         info("running smoke test");
