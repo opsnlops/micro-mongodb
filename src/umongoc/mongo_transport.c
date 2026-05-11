@@ -46,7 +46,10 @@ struct mongo_transport {
     /* TLS config -- NULL means plain TCP. The altcp_tls_config is owned by
      * lwIP/mbedTLS and freed via altcp_tls_free_config in transport_free. */
     struct altcp_tls_config *tls_config;
-    char sni_hostname[128];
+    /* 256 bytes matches MONGO_URI_HOST_MAX. Atlas shard hostnames can run
+     * 50+ chars (`<shard>.<cluster>.<id>.mongodb.net`) and we still need
+     * headroom for any future longer-form hostnames. */
+    char sni_hostname[256];
     bool tls_enabled;
 };
 
