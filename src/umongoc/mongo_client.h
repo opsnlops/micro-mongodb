@@ -116,6 +116,15 @@ typedef struct {
 int mongo_client_ensure_timeseries(mongo_client_t *c, const char *db, const char *coll,
                                    const mongo_timeseries_opts_t *opts, uint32_t timeout_ms);
 
+/* -- Internal helpers used by mongo_cursor when a cursor was created via
+ * mongo_client_find(). These aren't part of the stable end-user API; they
+ * exist so that getMore / killCursors traffic on a cursor takes the same
+ * mutex as concurrent CRUD calls on the parent client. Treat them as
+ * library-private. */
+void mongo_client_lock_(mongo_client_t *c);
+void mongo_client_unlock_(mongo_client_t *c);
+void mongo_client_note_op_rc_(mongo_client_t *c, int rc);
+
 #ifdef __cplusplus
 }
 #endif

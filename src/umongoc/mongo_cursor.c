@@ -5,11 +5,17 @@
 #include "FreeRTOS.h"
 
 #include "logging.h"
+#include "mongo_client.h"
 
 #define MAX_NS_LEN 128 /* db.coll string -- generous */
 
 struct mongo_cursor {
     mongo_transport_t *t;
+    /* Optional. When set (via mongo_cursor_set_client by mongo_client_find),
+     * cursor operations that touch the network -- getMore in _next, and the
+     * killCursors in _destroy -- take this client's mutex first, so they
+     * don't race with concurrent CRUD calls from another task. */
+    struct mongo_client *client;
     char db[64];
     char coll[64];
     int32_t batch_size;
@@ -22,6 +28,13 @@ struct mongo_cursor {
     bool current_doc_init; /* whether current_doc is valid this turn */
     size_t total_seen;
 };
+
+void mongo_cursor_set_client(mongo_cursor_t *c, struct mongo_client *client) {
+    if (!c) {
+        return;
+    }
+    c->client = client;
+}
 
 /* Walk the reply for the standard "cursor.{id, firstBatch|nextBatch}" shape.
  * On success, leaves cursor->doc_iter ready to be bson_iter_next()'d into
@@ -149,7 +162,18 @@ static int send_get_more(mongo_cursor_t *c, uint32_t timeout_ms) {
 
     clear_batch_reply(c);
 
+    /* If this cursor belongs to a client, hold the client's mutex for the
+     * length of the getMore round-trip. mongo_client_note_op_rc_ tells the
+     * client to mark itself disconnected on a transport error, matching what
+     * CLIENT_DO does for CRUD calls. */
+    if (c->client) {
+        mongo_client_lock_(c->client);
+    }
     int rc = mongo_run_command(c->t, c->db, &cmd, &c->batch_reply, timeout_ms);
+    if (c->client) {
+        mongo_client_note_op_rc_(c->client, rc);
+        mongo_client_unlock_(c->client);
+    }
     bson_destroy(&cmd);
     if (rc != MONGO_WIRE_OK) {
         return rc;
@@ -209,7 +233,9 @@ void mongo_cursor_destroy(mongo_cursor_t *c) {
     }
     if (c->cursor_id != 0 && c->t) {
         /* Best-effort killCursors so the server can free its state. We don't
-         * care about errors here -- the connection might be torn down already. */
+         * care about errors here -- the connection might be torn down already.
+         * Holds the client mutex (if any) for the round-trip so this can't
+         * step on a CRUD call in flight from another task. */
         bson_t cmd;
         bson_init(&cmd);
         bson_append_utf8(&cmd, "killCursors", 11, c->coll, -1);
@@ -219,7 +245,15 @@ void mongo_cursor_destroy(mongo_cursor_t *c) {
         bson_append_array_end(&cmd, &arr);
 
         bson_t reply;
-        if (mongo_run_command(c->t, c->db, &cmd, &reply, 2000) == MONGO_WIRE_OK) {
+        if (c->client) {
+            mongo_client_lock_(c->client);
+        }
+        int rc = mongo_run_command(c->t, c->db, &cmd, &reply, 2000);
+        if (c->client) {
+            mongo_client_note_op_rc_(c->client, rc);
+            mongo_client_unlock_(c->client);
+        }
+        if (rc == MONGO_WIRE_OK) {
             bson_destroy(&reply);
         }
         bson_destroy(&cmd);

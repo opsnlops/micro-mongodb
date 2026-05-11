@@ -298,7 +298,26 @@ int mongo_client_find(mongo_client_t *c, const char *db, const char *coll, const
     if (timeout_ms == 0) {
         timeout_ms = c->default_timeout_ms;
     }
-    CLIENT_DO(c, timeout_ms, mongo_find(c->t, db, coll, filter, batch_size, out_cursor, timeout_ms));
+    /* Inline rather than via CLIENT_DO so we can hand the cursor a reference
+     * to this client before unlocking. From that point on the cursor's own
+     * getMore / killCursors calls will take and release c->mutex themselves. */
+    if (xSemaphoreTake(c->mutex, portMAX_DELAY) != pdTRUE) {
+        return MONGO_WIRE_ERR_ARGS;
+    }
+    int ec = c->connected ? 0 : connect_locked(c, timeout_ms);
+    if (ec != 0) {
+        xSemaphoreGive(c->mutex);
+        return ec;
+    }
+    int rc = mongo_find(c->t, db, coll, filter, batch_size, out_cursor, timeout_ms);
+    if (rc == MONGO_WIRE_OK && out_cursor && *out_cursor) {
+        mongo_cursor_set_client(*out_cursor, c);
+    }
+    if (rc == MONGO_WIRE_ERR_TRANSPORT || rc == MONGO_WIRE_ERR_ALLOC) {
+        mark_disconnected(c);
+    }
+    xSemaphoreGive(c->mutex);
+    return rc;
 }
 
 int mongo_client_update(mongo_client_t *c, const char *db, const char *coll, const bson_t *filter, const bson_t *update,
@@ -394,4 +413,27 @@ int mongo_client_ensure_timeseries(mongo_client_t *c, const char *db, const char
     mongo_log_reply_error("create timeseries", &reply);
     bson_destroy(&reply);
     return MONGO_WIRE_ERR_PROTOCOL;
+}
+
+void mongo_client_lock_(mongo_client_t *c) {
+    if (!c || !c->mutex) {
+        return;
+    }
+    xSemaphoreTake(c->mutex, portMAX_DELAY);
+}
+
+void mongo_client_unlock_(mongo_client_t *c) {
+    if (!c || !c->mutex) {
+        return;
+    }
+    xSemaphoreGive(c->mutex);
+}
+
+void mongo_client_note_op_rc_(mongo_client_t *c, int rc) {
+    if (!c) {
+        return;
+    }
+    if (rc == MONGO_WIRE_ERR_TRANSPORT || rc == MONGO_WIRE_ERR_ALLOC) {
+        mark_disconnected(c);
+    }
 }

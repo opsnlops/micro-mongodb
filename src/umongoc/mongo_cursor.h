@@ -34,6 +34,19 @@ extern "C" {
 
 typedef struct mongo_cursor mongo_cursor_t;
 
+/* Forward declaration -- defined in mongo_client.h. The cursor stores an
+ * optional client pointer so multi-task callers can rely on the client's
+ * internal mutex to serialize getMore / killCursors traffic against
+ * concurrent CRUD calls on the same client. NULL when the cursor was
+ * created via the lower-level transport-only `mongo_find()` API. */
+struct mongo_client;
+
+/* Tag the cursor with the client whose mutex it should hold while
+ * doing network I/O. Called by mongo_client_find() right after the
+ * underlying mongo_find() returns; not part of the public end-user API
+ * for cursors obtained from mongo_find() directly. */
+void mongo_cursor_set_client(mongo_cursor_t *c, struct mongo_client *client);
+
 /* Run `find` and stash the initial batch in a fresh cursor. On success the
  * cursor is owned by the caller and must be released with
  * mongo_cursor_destroy().
