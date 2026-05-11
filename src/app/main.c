@@ -27,6 +27,7 @@
 #include "mongo_crud.h"
 #include "mongo_cursor.h"
 #include "mongo_transport.h"
+#include "mongo_uri.h"
 #include "mongo_wire.h"
 
 #ifndef WIFI_SSID
@@ -45,45 +46,6 @@
 #define TEST_DB "micro_mongodb"
 #define TEST_COLL "pico"
 #define CMD_TIMEOUT_MS 5000
-
-/* Minimal mongodb:// parser -- proper URI handling (auth, options, +srv) lands
- * in task #6. Accepts "mongodb://host[:port][/...]"; ignores everything after
- * the first '/'. */
-static bool parse_mongo_uri(const char *uri, char *host_out, size_t host_sz, uint16_t *port_out) {
-    static const char prefix[] = "mongodb://";
-    size_t prefix_len = sizeof prefix - 1;
-    if (strncmp(uri, prefix, prefix_len) != 0) {
-        return false;
-    }
-    const char *rest = uri + prefix_len;
-    const char *path = strchr(rest, '/');
-    size_t hostport_len = path ? (size_t)(path - rest) : strlen(rest);
-
-    const char *colon = NULL;
-    for (size_t i = 0; i < hostport_len; i++) {
-        if (rest[i] == ':') {
-            colon = rest + i;
-        }
-    }
-
-    size_t host_len = colon ? (size_t)(colon - rest) : hostport_len;
-    if (host_len == 0 || host_len >= host_sz) {
-        return false;
-    }
-    memcpy(host_out, rest, host_len);
-    host_out[host_len] = '\0';
-
-    if (colon) {
-        unsigned long port = strtoul(colon + 1, NULL, 10);
-        if (port == 0 || port > 65535) {
-            return false;
-        }
-        *port_out = (uint16_t)port;
-    } else {
-        *port_out = 27017;
-    }
-    return true;
-}
 
 /* Pull a numeric `ok` from a reply doc. Server returns 1.0 or 1, depending. */
 static double reply_ok(const bson_t *reply) {
@@ -235,15 +197,19 @@ static void network_task(void *arg) {
     }
     info("wifi connected");
 
-    char host[128];
-    uint16_t port = 0;
-    if (!parse_mongo_uri(MONGO_URI, host, sizeof host, &port)) {
-        error("could not parse MONGO_URI: %s", MONGO_URI);
+    mongo_uri_t uri;
+    int uri_rc = mongo_uri_parse(MONGO_URI, &uri, 5000);
+    if (uri_rc != MONGO_URI_OK) {
+        error("mongo_uri_parse: rc=%d for %s", uri_rc, MONGO_URI);
         for (;;) {
             vTaskDelay(pdMS_TO_TICKS(5000));
         }
     }
-    info("mongo target host=%s port=%u", host, port);
+    info("mongo target: %zu host(s), tls=%d, srv=%d, replicaSet='%s'", uri.n_hosts, (int)uri.tls, (int)uri.is_srv,
+         uri.replica_set);
+    for (size_t i = 0; i < uri.n_hosts; i++) {
+        info("  host[%zu] = %s:%u", i, uri.hosts[i].host, uri.hosts[i].port);
+    }
 
     mongo_transport_t *t = mongo_transport_new();
     if (!t) {
@@ -253,9 +219,13 @@ static void network_task(void *arg) {
         }
     }
 
+    /* Pick the first host. Multi-host failover is task 9 (Atlas RS quirks). */
+    const char *target_host = uri.hosts[0].host;
+    uint16_t target_port = uri.hosts[0].port;
+
     for (;;) {
-        info("opening tcp connection ...");
-        rc = mongo_transport_connect(t, host, port, 5000);
+        info("opening tcp connection to %s:%u ...", target_host, target_port);
+        rc = mongo_transport_connect(t, target_host, target_port, 5000);
         if (rc != MONGO_TRANSPORT_OK) {
             error("connect failed: rc=%d (lwip err=%d)", rc, mongo_transport_last_err(t));
             vTaskDelay(pdMS_TO_TICKS(5000));

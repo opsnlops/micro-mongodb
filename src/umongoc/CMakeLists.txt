@@ -3,6 +3,8 @@ add_library(umongoc STATIC
     mongo_wire.c
     mongo_crud.c
     mongo_cursor.c
+    mongo_dns.c
+    mongo_uri.c
 )
 
 target_include_directories(umongoc PUBLIC
