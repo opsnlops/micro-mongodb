@@ -236,6 +236,7 @@ static void network_task(void *arg) {
     }
     info("mongo target: %zu host(s), tls=%d, srv=%d, replicaSet='%s'", uri.n_hosts, (int)uri.tls, (int)uri.is_srv,
          uri.replica_set);
+    info("  user='%s' authSource='%s' database='%s'", uri.username, uri.auth_source, uri.database);
     for (size_t i = 0; i < uri.n_hosts; i++) {
         info("  host[%zu] = %s:%u", i, uri.hosts[i].host, uri.hosts[i].port);
     }

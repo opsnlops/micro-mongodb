@@ -197,6 +197,11 @@ int mongo_authenticate_scram_sha256(mongo_transport_t *t, const char *auth_sourc
         }
     }
 
+    /* Diagnostic line: shows what we're going to send without revealing the
+     * password. Critical for telling apart "wrong creds" from "wrong URI
+     * parsing" (Atlas's "bad auth" reply is the same in both cases). */
+    debug("[auth] SCRAM user='%s' authSource='%s' pw_len=%u", username, auth_source, (unsigned)strlen(password));
+
     /* ---- client-first ---- */
     uint8_t nonce_raw[SCRAM_NONCE_RAW];
     rand_bytes(nonce_raw, sizeof nonce_raw);

@@ -17,6 +17,42 @@ static bool copy_n(char *dst, size_t dst_sz, const char *src, size_t len) {
     return true;
 }
 
+static int hex_digit(char c) {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
+/* In-place percent-decode of `s` (NUL-terminated). Returns true on success.
+ * Used for username/password from the URI userinfo segment -- Atlas's UI will
+ * %-encode any '@' / ':' / '/' etc the user puts in their password. */
+static bool url_decode_inplace(char *s) {
+    char *src = s;
+    char *dst = s;
+    while (*src) {
+        if (*src == '%') {
+            int hi = hex_digit(src[1]);
+            int lo = hex_digit(src[2]);
+            if (hi < 0 || lo < 0) {
+                return false;
+            }
+            *dst++ = (char)((hi << 4) | lo);
+            src += 3;
+        } else {
+            *dst++ = *src++;
+        }
+    }
+    *dst = '\0';
+    return true;
+}
+
 static bool append_str(char *dst, size_t dst_sz, const char *src) {
     size_t cur = strlen(dst);
     size_t add = strlen(src);
@@ -149,7 +185,9 @@ int mongo_uri_parse(const char *uri_str, mongo_uri_t *out, uint32_t dns_timeout_
     const char *slash = find_char_in(p, body_end, '/');
     const char *host_part_end = slash ? slash : body_end;
 
-    /* Optional credentials terminated by '@' (within the host segment). */
+    /* Optional credentials terminated by '@' (within the host segment).
+     * Credentials are percent-decoded so passwords with special chars (which
+     * the Atlas UI URL-encodes) reach SCRAM in their literal form. */
     const char *at = find_char_in(p, host_part_end, '@');
     if (at) {
         const char *user_end = find_char_in(p, at, ':');
@@ -164,6 +202,10 @@ int mongo_uri_parse(const char *uri_str, mongo_uri_t *out, uint32_t dns_timeout_
             if (!copy_n(out->username, sizeof out->username, p, (size_t)(at - p))) {
                 return MONGO_URI_ERR_FORMAT;
             }
+        }
+        if (!url_decode_inplace(out->username) || !url_decode_inplace(out->password)) {
+            error("[uri] malformed percent-encoding in credentials");
+            return MONGO_URI_ERR_FORMAT;
         }
         p = at + 1;
     }
