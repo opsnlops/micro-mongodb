@@ -250,29 +250,38 @@ static void network_task(void *arg) {
         info("  host[%zu] = %s:%u", i, uri.hosts[i].host, uri.hosts[i].port);
     }
 
-    /* Pick the first host. Multi-host failover is task 9 (Atlas RS quirks). */
-    const char *target_host = uri.hosts[0].host;
+    /* Start with the first host the SRV record returned. If we land on a
+     * secondary, the hello reply tells us who the actual primary is and
+     * we swap targets below -- minimal SDAM-lite for replica sets. */
+    char target_host[MONGO_URI_HOST_MAX];
+    strncpy(target_host, uri.hosts[0].host, sizeof target_host - 1);
+    target_host[sizeof target_host - 1] = '\0';
     uint16_t target_port = uri.hosts[0].port;
 
     mongo_transport_t *t = NULL;
-    if (uri.tls) {
-        mongo_tls_config_t tls = {0};
-        tls.sni_hostname = target_host;
-        t = mongo_transport_new(&tls);
-        info("transport: TLS enabled, sni=%s", target_host);
-    } else {
-        t = mongo_transport_new(NULL);
-        info("transport: plain TCP");
-    }
-    if (!t) {
-        error("mongo_transport_new failed");
-        for (;;) {
-            vTaskDelay(pdMS_TO_TICKS(5000));
-        }
-    }
 
     for (;;) {
-        info("opening tcp connection to %s:%u ...", target_host, target_port);
+        /* (Re)create the transport so SNI matches our current target. The
+         * cost of free+new is small; the TLS handshake is what's expensive,
+         * and that's bound to the connect path either way. */
+        if (t) {
+            mongo_transport_free(t);
+            t = NULL;
+        }
+        if (uri.tls) {
+            mongo_tls_config_t tls = {0};
+            tls.sni_hostname = target_host;
+            t = mongo_transport_new(&tls);
+        } else {
+            t = mongo_transport_new(NULL);
+        }
+        if (!t) {
+            error("mongo_transport_new failed");
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+
+        info("opening tcp connection to %s:%u ... (%s)", target_host, target_port, uri.tls ? "TLS" : "plain");
         TIMED_BEGIN(connect);
         rc = mongo_transport_connect(t, target_host, target_port, 5000);
         int t_connect = TIMED_US(connect);
@@ -281,7 +290,7 @@ static void network_task(void *arg) {
             vTaskDelay(pdMS_TO_TICKS(5000));
             continue;
         }
-        info("connected (%d us, %s)", t_connect, uri.tls ? "TLS" : "plain");
+        info("connected (%d us)", t_connect);
 
         /* hello handshake. If we have credentials, ask the server which
          * mechanisms are actually enabled for this specific user. */
@@ -302,6 +311,44 @@ static void network_task(void *arg) {
             continue;
         }
         info("hello ok (%d us)", t_hello);
+
+        /* Replica-set primary discovery (mini-SDAM). If hello tells us we
+         * landed on a secondary, swap to the primary it advertises and
+         * restart the cycle. Writes only work against the primary; without
+         * this, a NotWritablePrimary failure loop is the result. */
+        {
+            bson_iter_t mit;
+            bool is_writable_primary = false;
+            if (bson_iter_init_find(&mit, &hello_reply, "isWritablePrimary") && BSON_ITER_HOLDS_BOOL(&mit)) {
+                is_writable_primary = bson_iter_bool(&mit);
+            } else if (bson_iter_init_find(&mit, &hello_reply, "ismaster") && BSON_ITER_HOLDS_BOOL(&mit)) {
+                is_writable_primary = bson_iter_bool(&mit);
+            }
+            if (!is_writable_primary) {
+                const char *primary_str = NULL;
+                if (bson_iter_init_find(&mit, &hello_reply, "primary") && BSON_ITER_HOLDS_UTF8(&mit)) {
+                    primary_str = bson_iter_utf8(&mit, NULL);
+                }
+                if (primary_str && primary_str[0]) {
+                    const char *colon = strchr(primary_str, ':');
+                    size_t host_len = colon ? (size_t)(colon - primary_str) : strlen(primary_str);
+                    if (host_len > 0 && host_len < sizeof target_host) {
+                        memcpy(target_host, primary_str, host_len);
+                        target_host[host_len] = '\0';
+                        target_port = colon ? (uint16_t)strtoul(colon + 1, NULL, 10) : 27017;
+                        info("[net] connected to secondary; redirecting to primary %s:%u", target_host, target_port);
+                        bson_destroy(&hello_reply);
+                        mongo_transport_close(t);
+                        continue; /* loop will recreate transport with new SNI */
+                    }
+                }
+                warning("[net] connected to secondary but primary unknown; retrying in 2s");
+                bson_destroy(&hello_reply);
+                mongo_transport_close(t);
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                continue;
+            }
+        }
 
         /* SCRAM if credentials are configured. The driver picks SHA-256 or
          * SHA-1 based on the hello reply's saslSupportedMechs. */
