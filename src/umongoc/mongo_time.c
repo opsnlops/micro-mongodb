@@ -82,6 +82,14 @@ int64_t mongo_time_now_ms(void) {
 
 bool mongo_time_is_synced(void) { return g_time_synced; }
 
+time_t mongo_time_seconds(time_t *t) {
+    time_t secs = (time_t)(mongo_time_now_ms() / 1000);
+    if (t) {
+        *t = secs;
+    }
+    return secs;
+}
+
 size_t mongo_time_format_iso8601(char *out, size_t sz) {
     if (!out || sz == 0) {
         return 0;

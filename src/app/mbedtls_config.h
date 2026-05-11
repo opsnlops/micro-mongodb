@@ -30,6 +30,19 @@
 #define MBEDTLS_ALLOW_PRIVATE_ACCESS
 #define MBEDTLS_HAVE_TIME
 
+/* Make X.509 chain validation actually check the certificate's notBefore /
+ * notAfter dates. Without MBEDTLS_HAVE_TIME_DATE the chain validator skips
+ * date checks entirely, so an attacker can re-use an expired-but-otherwise-
+ * valid cert that they extracted from a compromised host. We need a working
+ * `time()`: we provide mongo_time_seconds() (SNTP-synced wall clock) via
+ * MBEDTLS_PLATFORM_TIME_MACRO. Before SNTP completes mongo_time_seconds()
+ * returns 0, which would make every cert appear not-yet-valid -- but we don't
+ * attempt TLS until after SNTP sync (see app/main.c), so the window is closed.
+ */
+#define MBEDTLS_HAVE_TIME_DATE
+#include "mongo_time.h"
+#define MBEDTLS_PLATFORM_TIME_MACRO mongo_time_seconds
+
 #define MBEDTLS_SSL_SERVER_NAME_INDICATION /* SNI is mandatory for Atlas */
 
 /* Hash / MAC / cipher primitives. Keep SHA-1 around for older certs even
