@@ -126,12 +126,27 @@ static bool hello_is_primary_else_redirect(mongo_client_t *c, const bson_t *hell
         return true;
     }
 
+    /* The "primary" field is server-supplied: validate it before using it as
+     * a hostname. bson_iter_utf8 hands back the declared UTF-8 length, so we
+     * compare that to strlen to detect an embedded NUL -- a server with
+     * either a bug or hostile intent could otherwise plant data after the
+     * NUL that we'd then ignore while feeding the first chunk to mbedTLS as
+     * an SNI string. */
+    uint32_t primary_len = 0;
     const char *primary_str = NULL;
     if (bson_iter_init_find(&it, hello_reply, "primary") && BSON_ITER_HOLDS_UTF8(&it)) {
-        primary_str = bson_iter_utf8(&it, NULL);
+        primary_str = bson_iter_utf8(&it, &primary_len);
     }
     if (!primary_str || !primary_str[0]) {
         warning("[client] on secondary but no primary known");
+        return false;
+    }
+    if (strnlen(primary_str, primary_len) != primary_len) {
+        warning("[client] primary hint contains embedded NUL; rejecting");
+        return false;
+    }
+    if (primary_len >= sizeof c->target_host) {
+        warning("[client] primary hint too long (%u bytes); rejecting", (unsigned)primary_len);
         return false;
     }
 
@@ -141,9 +156,18 @@ static bool hello_is_primary_else_redirect(mongo_client_t *c, const bson_t *hell
         warning("[client] malformed primary hint: %s", primary_str);
         return false;
     }
+    uint16_t port = 27017;
+    if (colon) {
+        unsigned long pn = strtoul(colon + 1, NULL, 10);
+        if (pn == 0 || pn > 65535) {
+            warning("[client] primary hint has invalid port: %s", primary_str);
+            return false;
+        }
+        port = (uint16_t)pn;
+    }
     memcpy(c->target_host, primary_str, host_len);
     c->target_host[host_len] = '\0';
-    c->target_port = colon ? (uint16_t)strtoul(colon + 1, NULL, 10) : 27017;
+    c->target_port = port;
     info("[client] redirecting to primary %s:%u", c->target_host, c->target_port);
     return false;
 }
