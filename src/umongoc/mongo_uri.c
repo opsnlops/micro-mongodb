@@ -124,29 +124,53 @@ static int parse_host_list(const char *start, const char *end, mongo_uri_t *out)
     return MONGO_URI_OK;
 }
 
-/* Apply one `k=v` option pair. Unknown keys are silently ignored. */
-static void apply_option(mongo_uri_t *out, const char *key, size_t klen, const char *val, size_t vlen) {
+/* Source of an option pair. The spec is strict about what may be set via TXT:
+ * only `authSource` and `replicaSet` are permitted. A hostile DNS resolver
+ * (`mongodb+srv://` does TXT over plain UDP) could otherwise flip `tls=false`
+ * and silently strip transport encryption from a connection that the user
+ * intended to be TLS-protected. Anything outside the allow-list is logged at
+ * warning and dropped. */
+typedef enum {
+    OPT_SOURCE_URI = 0, /* trusted: came from the user-supplied URI string */
+    OPT_SOURCE_TXT = 1, /* untrusted: came from a DNS TXT record */
+} opt_source_t;
+
+/* Apply one `k=v` option pair. Unknown keys are silently ignored.
+ * When `source == OPT_SOURCE_TXT`, only spec-allowed keys are honored. */
+static void apply_option(mongo_uri_t *out, const char *key, size_t klen, const char *val, size_t vlen,
+                         opt_source_t source) {
     if (klen == 3 && strncmp(key, "tls", 3) == 0) {
+        if (source == OPT_SOURCE_TXT) {
+            warning("[uri] rejecting tls= from TXT record (not spec-allowed)");
+            return;
+        }
         out->tls = (vlen == 4 && strncmp(val, "true", 4) == 0);
     } else if (klen == 3 && strncmp(key, "ssl", 3) == 0) {
+        if (source == OPT_SOURCE_TXT) {
+            warning("[uri] rejecting ssl= from TXT record (not spec-allowed)");
+            return;
+        }
         out->tls = (vlen == 4 && strncmp(val, "true", 4) == 0);
     } else if (klen == 10 && strncmp(key, "replicaSet", 10) == 0) {
         copy_n(out->replica_set, sizeof out->replica_set, val, vlen);
     } else if (klen == 10 && strncmp(key, "authSource", 10) == 0) {
         copy_n(out->auth_source, sizeof out->auth_source, val, vlen);
+    } else if (source == OPT_SOURCE_TXT) {
+        warning("[uri] dropping unrecognized TXT option key: %.*s", (int)klen, key);
     }
-    /* Other options: ignored for now. */
+    /* Unknown keys from the URI: ignored silently (the spec encourages
+     * forward-compat). Unknown keys from TXT: warned above. */
 }
 
 /* Parse a "k=v&k=v" option string. */
-static void parse_options(const char *start, const char *end, mongo_uri_t *out) {
+static void parse_options(const char *start, const char *end, mongo_uri_t *out, opt_source_t source) {
     const char *p = start;
     while (p < end) {
         const char *amp = find_char_in(p, end, '&');
         const char *pair_end = amp ? amp : end;
         const char *eq = find_char_in(p, pair_end, '=');
         if (eq) {
-            apply_option(out, p, (size_t)(eq - p), eq + 1, (size_t)(pair_end - (eq + 1)));
+            apply_option(out, p, (size_t)(eq - p), eq + 1, (size_t)(pair_end - (eq + 1)), source);
         }
         if (!amp) {
             break;
@@ -257,7 +281,7 @@ int mongo_uri_parse(const char *uri_str, mongo_uri_t *out, uint32_t dns_timeout_
         char txt[256];
         int txt_rc = mongo_dns_query_txt(seed, txt, sizeof txt, dns_timeout_ms);
         if (txt_rc == MONGO_DNS_OK && txt[0] != '\0') {
-            parse_options(txt, txt + strlen(txt), out);
+            parse_options(txt, txt + strlen(txt), out, OPT_SOURCE_TXT);
         }
 
         /* SRV: _mongodb._tcp.<seed_host> */
@@ -292,7 +316,7 @@ int mongo_uri_parse(const char *uri_str, mongo_uri_t *out, uint32_t dns_timeout_
     }
 
     if (opts_start) {
-        parse_options(opts_start, uri_end, out);
+        parse_options(opts_start, uri_end, out, OPT_SOURCE_URI);
     }
 
     return MONGO_URI_OK;
