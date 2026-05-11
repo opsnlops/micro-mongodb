@@ -20,10 +20,22 @@ if(NOT DEFINED PICO_SDK_PATH)
     endif()
 endif()
 
-# Target the Pico 2 W (RP2350 + CYW43 wifi)
+# Target either the Pico 2 W (RP2350) or the original Pico W (RP2040). Switch
+# with `cmake -DPICO_BOARD=pico_w` or `-DPICO_BOARD=pico2_w` (default).
 set(PICO_BOARD pico2_w CACHE STRING "Board the firmware is built for")
-set(PICO_PLATFORM rp2350 CACHE STRING "Pico platform target")
-add_compile_definitions(PICO_PLATFORM_IS_RP2350=1)
+
+if(PICO_BOARD MATCHES "^pico2")
+    set(PICO_PLATFORM rp2350 CACHE STRING "Pico platform target" FORCE)
+    add_compile_definitions(PICO_PLATFORM_IS_RP2350=1)
+    set(MICRO_MONGODB_FREERTOS_PORT_DIR "RP2350_ARM_NTZ")
+elseif(PICO_BOARD MATCHES "^pico")
+    set(PICO_PLATFORM rp2040 CACHE STRING "Pico platform target" FORCE)
+    add_compile_definitions(PICO_PLATFORM_IS_RP2350=0)
+    set(MICRO_MONGODB_FREERTOS_PORT_DIR "RP2040")
+else()
+    message(FATAL_ERROR "Unsupported PICO_BOARD '${PICO_BOARD}'. Use pico_w or pico2_w.")
+endif()
+message(STATUS "Board ${PICO_BOARD} -> platform ${PICO_PLATFORM}, FreeRTOS port ${MICRO_MONGODB_FREERTOS_PORT_DIR}")
 
 # FreeRTOS config (matches FreeRTOSConfig.h at repo root)
 set(FREERTOS_HEAP "4" CACHE STRING "" FORCE)
@@ -75,7 +87,7 @@ add_library(freertos_config INTERFACE)
 target_include_directories(freertos_config SYSTEM INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}
 )
-include(${FREERTOS_KERNEL_PATH}/portable/ThirdParty/GCC/RP2350_ARM_NTZ/FreeRTOS_Kernel_import.cmake)
+include(${FREERTOS_KERNEL_PATH}/portable/ThirdParty/GCC/${MICRO_MONGODB_FREERTOS_PORT_DIR}/FreeRTOS_Kernel_import.cmake)
 
 message(STATUS "Building micro-mongodb ${PROJECT_VERSION} for ${PICO_PLATFORM} (board=${PICO_BOARD})")
 
