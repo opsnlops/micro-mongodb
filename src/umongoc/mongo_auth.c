@@ -14,6 +14,29 @@
 #include "logging.h"
 #include "mongo_wire.h"
 
+/* TEMP: detailed SCRAM diagnostic logging. Leaks salted-password-derived
+ * material to the log, so set back to 0 once auth is working. */
+#ifndef MONGO_SCRAM_DEBUG
+#define MONGO_SCRAM_DEBUG 1
+#endif
+
+#if MONGO_SCRAM_DEBUG
+static void hexify(const uint8_t *bytes, size_t n, char *out, size_t out_sz) {
+    static const char hex[] = "0123456789abcdef";
+    if (out_sz < 1) {
+        return;
+    }
+    if (n * 2 + 1 > out_sz) {
+        n = (out_sz - 1) / 2;
+    }
+    for (size_t i = 0; i < n; i++) {
+        out[i * 2] = hex[bytes[i] >> 4];
+        out[i * 2 + 1] = hex[bytes[i] & 0x0f];
+    }
+    out[n * 2] = '\0';
+}
+#endif
+
 #define SCRAM_NONCE_RAW 24 /* spec: 24 random bytes per server-side */
 #define SCRAM_NONCE_B64 ((SCRAM_NONCE_RAW + 2) / 3 * 4 + 1)
 #define SCRAM_KEY_LEN 32 /* SHA-256 output */
@@ -299,6 +322,18 @@ int mongo_authenticate_scram_sha256(mongo_transport_t *t, const char *auth_sourc
         return MONGO_AUTH_ERR_PROTOCOL;
     }
 
+#if MONGO_SCRAM_DEBUG
+    debug("[auth] server-first parsed: iterations=%ld salt_b64='%s' salt_len=%u", iterations, salt_b64,
+          (unsigned)salt_len);
+    {
+        char hex[2 * sizeof salt + 1];
+        hexify(salt, salt_len, hex, sizeof hex);
+        debug("[auth] salt hex=%s", hex);
+    }
+    debug("[auth] client_first_bare='%s'", client_first_bare);
+    debug("[auth] server_first='%s'", server_first);
+#endif
+
     /* ---- key derivation ---- */
     uint8_t salted_password[SCRAM_KEY_LEN];
     {
@@ -326,6 +361,18 @@ int mongo_authenticate_scram_sha256(mongo_transport_t *t, const char *auth_sourc
         return MONGO_AUTH_ERR_CRYPTO;
     }
 
+#if MONGO_SCRAM_DEBUG
+    {
+        char hex[2 * SCRAM_KEY_LEN + 1];
+        hexify(salted_password, SCRAM_KEY_LEN, hex, sizeof hex);
+        debug("[auth] salted_password=%s", hex);
+        hexify(client_key, SCRAM_KEY_LEN, hex, sizeof hex);
+        debug("[auth] client_key=%s", hex);
+        hexify(stored_key, SCRAM_KEY_LEN, hex, sizeof hex);
+        debug("[auth] stored_key=%s", hex);
+    }
+#endif
+
     /* ---- client-final ---- */
     char client_final_without_proof[SCRAM_FIELD_MAX];
     int cfwp_len = snprintf(client_final_without_proof, sizeof client_final_without_proof, "c=%s,r=%s",
@@ -342,6 +389,11 @@ int mongo_authenticate_scram_sha256(mongo_transport_t *t, const char *auth_sourc
         return MONGO_AUTH_ERR_PROTOCOL;
     }
 
+#if MONGO_SCRAM_DEBUG
+    debug("[auth] client_final_without_proof='%s'", client_final_without_proof);
+    debug("[auth] auth_message='%s'", auth_message);
+#endif
+
     uint8_t client_signature[SCRAM_KEY_LEN];
     if (hmac_sha256(stored_key, SCRAM_KEY_LEN, (const uint8_t *)auth_message, (size_t)am_len, client_signature) != 0) {
         return MONGO_AUTH_ERR_CRYPTO;
@@ -351,6 +403,16 @@ int mongo_authenticate_scram_sha256(mongo_transport_t *t, const char *auth_sourc
     for (int i = 0; i < SCRAM_KEY_LEN; i++) {
         client_proof[i] = client_key[i] ^ client_signature[i];
     }
+
+#if MONGO_SCRAM_DEBUG
+    {
+        char hex[2 * SCRAM_KEY_LEN + 1];
+        hexify(client_signature, SCRAM_KEY_LEN, hex, sizeof hex);
+        debug("[auth] client_signature=%s", hex);
+        hexify(client_proof, SCRAM_KEY_LEN, hex, sizeof hex);
+        debug("[auth] client_proof=%s", hex);
+    }
+#endif
 
     char proof_b64[64];
     size_t proof_b64_len = 0;
