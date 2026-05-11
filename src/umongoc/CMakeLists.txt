@@ -5,6 +5,7 @@ add_library(umongoc STATIC
     mongo_cursor.c
     mongo_dns.c
     mongo_uri.c
+    mongo_ca.c
 )
 
 target_include_directories(umongoc PUBLIC
@@ -15,6 +16,8 @@ target_link_libraries(umongoc PUBLIC
     bson
     logging
     pico_cyw43_arch_lwip_sys_freertos
+    pico_lwip_mbedtls
+    pico_mbedtls
     FreeRTOS-Kernel
     freertos_config
 )

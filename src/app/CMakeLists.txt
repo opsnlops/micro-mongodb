@@ -22,6 +22,8 @@ target_compile_definitions(micro_mongodb_app PRIVATE
     # FreeRTOS / pico SMP debugging conveniences
     configUSE_TRACE_FACILITY=1
     configRECORD_STACK_HIGH_ADDRESS=1
+    # mbedTLS reads its config from this file (sits in src/app/).
+    MBEDTLS_CONFIG_FILE="mbedtls_config.h"
 )
 
 target_link_libraries(micro_mongodb_app

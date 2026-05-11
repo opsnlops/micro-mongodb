@@ -239,17 +239,26 @@ static void network_task(void *arg) {
         info("  host[%zu] = %s:%u", i, uri.hosts[i].host, uri.hosts[i].port);
     }
 
-    mongo_transport_t *t = mongo_transport_new();
+    /* Pick the first host. Multi-host failover is task 9 (Atlas RS quirks). */
+    const char *target_host = uri.hosts[0].host;
+    uint16_t target_port = uri.hosts[0].port;
+
+    mongo_transport_t *t = NULL;
+    if (uri.tls) {
+        mongo_tls_config_t tls = {0};
+        tls.sni_hostname = target_host;
+        t = mongo_transport_new(&tls);
+        info("transport: TLS enabled, sni=%s", target_host);
+    } else {
+        t = mongo_transport_new(NULL);
+        info("transport: plain TCP");
+    }
     if (!t) {
         error("mongo_transport_new failed");
         for (;;) {
             vTaskDelay(pdMS_TO_TICKS(5000));
         }
     }
-
-    /* Pick the first host. Multi-host failover is task 9 (Atlas RS quirks). */
-    const char *target_host = uri.hosts[0].host;
-    uint16_t target_port = uri.hosts[0].port;
 
     for (;;) {
         info("opening tcp connection to %s:%u ...", target_host, target_port);

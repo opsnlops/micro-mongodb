@@ -31,9 +31,25 @@ typedef enum {
     MONGO_TRANSPORT_ERR_LWIP = -6,
     MONGO_TRANSPORT_ERR_STATE = -7,
     MONGO_TRANSPORT_ERR_ARGS = -8,
+    MONGO_TRANSPORT_ERR_TLS = -9,
 } mongo_transport_status_t;
 
-mongo_transport_t *mongo_transport_new(void);
+/* TLS configuration. Pass NULL to mongo_transport_new() for plain TCP. */
+typedef struct {
+    /* PEM-encoded CA cert(s). If `ca_pem` is NULL, the built-in ISRG Root X1
+     * bundle (mongo_ca_default_pem) is used. */
+    const char *ca_pem;
+    size_t ca_pem_len;
+
+    /* Hostname for SNI. Required for Atlas. The string is copied; the buffer
+     * does not need to outlive this call. */
+    const char *sni_hostname;
+} mongo_tls_config_t;
+
+/* Create a transport. Pass NULL for plain TCP, or a populated mongo_tls_config_t
+ * for TLS. The CA / SNI must be set at creation time and apply to every
+ * subsequent mongo_transport_connect() call on this transport. */
+mongo_transport_t *mongo_transport_new(const mongo_tls_config_t *tls);
 void mongo_transport_free(mongo_transport_t *t);
 
 /* Connect to host:port. `host` may be a dotted-quad IPv4 ("192.168.1.42") or

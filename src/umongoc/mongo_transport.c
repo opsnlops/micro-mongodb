@@ -10,13 +10,17 @@
 
 #include "lwip/altcp.h"
 #include "lwip/altcp_tcp.h"
+#include "lwip/altcp_tls.h"
 #include "lwip/dns.h"
 #include "lwip/err.h"
 #include "lwip/ip_addr.h"
 #include "lwip/pbuf.h"
 #include "lwip/tcp.h"
 
+#include "mbedtls/ssl.h"
+
 #include "logging.h"
+#include "mongo_ca.h"
 
 /* Drain loop polls the rx pbuf chain. The semaphore wakes the caller when
  * a recv callback fires OR when an error/close signal arrives. */
@@ -38,6 +42,12 @@ struct mongo_transport {
 
     struct pbuf *rx_head; /* head of inbound pbuf chain */
     uint16_t rx_offset;   /* bytes already drained from rx_head */
+
+    /* TLS config -- NULL means plain TCP. The altcp_tls_config is owned by
+     * lwIP/mbedTLS and freed via altcp_tls_free_config in transport_free. */
+    struct altcp_tls_config *tls_config;
+    char sni_hostname[128];
+    bool tls_enabled;
 };
 
 /* ---------------- lwIP callbacks (tcpip thread context) ---------------- */
@@ -159,7 +169,7 @@ static int resolve_host(const char *host, ip_addr_t *out, uint32_t timeout_ms) {
 
 /* ---------------- public API ---------------- */
 
-mongo_transport_t *mongo_transport_new(void) {
+mongo_transport_t *mongo_transport_new(const mongo_tls_config_t *tls) {
     mongo_transport_t *t = pvPortMalloc(sizeof *t);
     if (!t) {
         return NULL;
@@ -178,6 +188,25 @@ mongo_transport_t *mongo_transport_new(void) {
         vPortFree(t);
         return NULL;
     }
+
+    if (tls) {
+        const uint8_t *ca = (const uint8_t *)(tls->ca_pem ? tls->ca_pem : mongo_ca_default_pem);
+        size_t ca_len = tls->ca_pem ? tls->ca_pem_len : mongo_ca_default_pem_len;
+
+        cyw43_arch_lwip_begin();
+        t->tls_config = altcp_tls_create_config_client(ca, ca_len);
+        cyw43_arch_lwip_end();
+
+        if (!t->tls_config) {
+            error("[xport] altcp_tls_create_config_client failed (CA parse?)");
+            mongo_transport_free(t);
+            return NULL;
+        }
+        if (tls->sni_hostname) {
+            strncpy(t->sni_hostname, tls->sni_hostname, sizeof t->sni_hostname - 1);
+        }
+        t->tls_enabled = true;
+    }
     return t;
 }
 
@@ -186,6 +215,12 @@ void mongo_transport_free(mongo_transport_t *t) {
         return;
     }
     mongo_transport_close(t);
+    if (t->tls_config) {
+        cyw43_arch_lwip_begin();
+        altcp_tls_free_config(t->tls_config);
+        cyw43_arch_lwip_end();
+        t->tls_config = NULL;
+    }
     if (t->connect_sem) {
         vSemaphoreDelete(t->connect_sem);
     }
@@ -219,12 +254,28 @@ int mongo_transport_connect(mongo_transport_t *t, const char *host, uint16_t por
     }
 
     cyw43_arch_lwip_begin();
-    t->pcb = altcp_tcp_new();
+    if (t->tls_enabled) {
+        t->pcb = altcp_tls_new(t->tls_config, IPADDR_TYPE_V4);
+    } else {
+        t->pcb = altcp_tcp_new();
+    }
     if (t->pcb) {
         altcp_arg(t->pcb, t);
         altcp_err(t->pcb, cb_err);
         altcp_recv(t->pcb, cb_recv);
         altcp_nagle_disable(t->pcb);
+
+        /* SNI: required for Atlas (its load balancer routes by SNI). For our
+         * own deployments it's harmless. */
+        if (t->tls_enabled && t->sni_hostname[0]) {
+            mbedtls_ssl_context *ssl = (mbedtls_ssl_context *)altcp_tls_context(t->pcb);
+            if (ssl) {
+                int sni_rc = mbedtls_ssl_set_hostname(ssl, t->sni_hostname);
+                if (sni_rc != 0) {
+                    error("[xport] mbedtls_ssl_set_hostname: %d", sni_rc);
+                }
+            }
+        }
     }
     t->state = XPORT_CONNECTING;
     err_t err = ERR_MEM;

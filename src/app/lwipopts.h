@@ -20,11 +20,11 @@
 #define LWIP_IPV4 1
 #define LWIP_IPV6 0
 
-/* altcp lets us swap plain TCP <-> TLS without touching call sites.
- * TLS itself stays off until task #7 wires in pico_lwip_mbedtls + a config. */
+/* altcp lets us swap plain TCP <-> TLS without touching call sites. mbedTLS
+ * is wired in for mongodb+srv:// (Atlas) and any URI with tls=true. */
 #define LWIP_ALTCP 1
-#define LWIP_ALTCP_TLS 0
-#define LWIP_ALTCP_TLS_MBEDTLS 0
+#define LWIP_ALTCP_TLS 1
+#define LWIP_ALTCP_TLS_MBEDTLS 1
 
 /* Buffer & memory sizing. These are conservative; revisit if we see drops. */
 #define MEM_LIBC_MALLOC 0
