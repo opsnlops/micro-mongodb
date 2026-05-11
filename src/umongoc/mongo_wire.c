@@ -15,14 +15,12 @@
 
 /* Per-process monotonically increasing request id. The wire protocol uses it
  * to pair replies with requests; with a single connection and serialized
- * round trips we mostly only check that responseTo matches what we sent. */
+ * round trips we mostly only check that responseTo matches what we sent.
+ * Atomic so a future second task running mongo_run_command can't tear the
+ * counter and have responseTo correlate to the wrong request. */
 static uint32_t g_request_id_counter = 1;
 
-static uint32_t next_request_id(void) {
-    /* No concurrent senders right now; if that changes wrap with a critical
-     * section. */
-    return g_request_id_counter++;
-}
+static uint32_t next_request_id(void) { return __atomic_fetch_add(&g_request_id_counter, 1, __ATOMIC_RELAXED); }
 
 static int32_t read_le_int32(const uint8_t *b) {
     return (int32_t)((uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24));

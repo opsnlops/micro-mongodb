@@ -238,16 +238,25 @@ static int dns_round_trip(const char *name, uint16_t qtype, dns_recv_ctx_t *ctx,
         return MONGO_DNS_ERR_SEND;
     }
 
-    int rc = MONGO_DNS_OK;
-    if (xSemaphoreTake(ctx->sem, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
-        rc = MONGO_DNS_ERR_TIMEOUT;
-    } else if (!ctx->ok) {
-        rc = MONGO_DNS_ERR_FORMAT;
-    }
+    BaseType_t took = xSemaphoreTake(ctx->sem, pdMS_TO_TICKS(timeout_ms));
 
+    /* Tear the pcb down BEFORE the caller observes ctx->reply. Once the
+     * callback is detached, no further packet can clobber ctx->reply or
+     * ctx->reply_len -- which a second matching-id packet (legitimate
+     * retry or malicious replay) could otherwise do in the tiny window
+     * between our sem-take and a later udp_remove. */
     cyw43_arch_lwip_begin();
     udp_remove(pcb);
     cyw43_arch_lwip_end();
+
+    int rc;
+    if (took != pdTRUE) {
+        rc = MONGO_DNS_ERR_TIMEOUT;
+    } else if (!ctx->ok) {
+        rc = MONGO_DNS_ERR_FORMAT;
+    } else {
+        rc = MONGO_DNS_OK;
+    }
     return rc;
 }
 

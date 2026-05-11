@@ -423,6 +423,13 @@ static int scram_auth_run(mongo_transport_t *t, const scram_mech_t *mech, const 
         error("[auth] server nonce does not begin with our client nonce");
         return MONGO_AUTH_ERR_NONCE_MISMATCH;
     }
+    /* RFC 5802 §5.1 mandates that the server append its own random to the
+     * client nonce; a server that just echoes our nonce verbatim reduces
+     * SCRAM's replay protection. Reject the no-op case explicitly. */
+    if (strlen(server_nonce) <= client_nonce_len) {
+        error("[auth] server nonce has no server-side random component");
+        return MONGO_AUTH_ERR_NONCE_MISMATCH;
+    }
     long iterations = strtol(iter_str, NULL, 10);
     if (iterations < SCRAM_MIN_ITERATIONS || iterations > SCRAM_MAX_ITERATIONS) {
         error("[auth] server iteration count %ld out of bounds [%d, %d]", iterations, SCRAM_MIN_ITERATIONS,
