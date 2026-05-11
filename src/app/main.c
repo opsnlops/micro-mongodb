@@ -1,10 +1,13 @@
 /* micro-mongodb bring-up entry point.
  *
- * Current scope:
- *   1. Init stdio (USB-CDC) and the queue-based logger.
- *   2. Bring up the CYW43 WiFi chip and join the configured network.
- *   3. Open a TCP connection to MONGO_URI, run a {ping:1}, log the reply.
- *   4. Heartbeat forever.
+ * Each cycle of the network task:
+ *   1. Connect to MONGO_URI's host:port.
+ *   2. Run a small CRUD smoke test (ping, insert, find+cursor, update, delete).
+ *   3. Disconnect and sleep before the next cycle.
+ *
+ * The smoke test is idempotent across runs -- each iteration tags its insert
+ * with the current ms-since-boot so concurrent boards don't collide on the
+ * same key, and the test ends by deleting its own row.
  */
 
 #include <stdbool.h>
@@ -13,6 +16,7 @@
 
 #include "pico/cyw43_arch.h"
 #include "pico/stdlib.h"
+#include "pico/time.h"
 
 #include "FreeRTOS.h"
 #include "task.h"
@@ -20,6 +24,8 @@
 #include <bson/bson.h>
 
 #include "logging.h"
+#include "mongo_crud.h"
+#include "mongo_cursor.h"
 #include "mongo_transport.h"
 #include "mongo_wire.h"
 
@@ -36,7 +42,11 @@
 #define NETWORK_TASK_STACK_WORDS 4096
 #define NETWORK_TASK_PRIORITY (tskIDLE_PRIORITY + 2)
 
-/* Minimal mongodb:// parser — proper URI handling (auth, options, +srv) lands
+#define TEST_DB "micro_mongodb"
+#define TEST_COLL "pico"
+#define CMD_TIMEOUT_MS 5000
+
+/* Minimal mongodb:// parser -- proper URI handling (auth, options, +srv) lands
  * in task #6. Accepts "mongodb://host[:port][/...]"; ignores everything after
  * the first '/'. */
 static bool parse_mongo_uri(const char *uri, char *host_out, size_t host_sz, uint16_t *port_out) {
@@ -49,8 +59,6 @@ static bool parse_mongo_uri(const char *uri, char *host_out, size_t host_sz, uin
     const char *path = strchr(rest, '/');
     size_t hostport_len = path ? (size_t)(path - rest) : strlen(rest);
 
-    /* Take the LAST ':' inside hostport to split host from port — robust against
-     * IPv6 literals later (though those need brackets, not handled yet). */
     const char *colon = NULL;
     for (size_t i = 0; i < hostport_len; i++) {
         if (rest[i] == ':') {
@@ -77,28 +85,127 @@ static bool parse_mongo_uri(const char *uri, char *host_out, size_t host_sz, uin
     return true;
 }
 
-static void run_ping(mongo_transport_t *t) {
+/* Pull a numeric `ok` from a reply doc. Server returns 1.0 or 1, depending. */
+static double reply_ok(const bson_t *reply) {
+    bson_iter_t it;
+    if (bson_iter_init_find(&it, reply, "ok") && BSON_ITER_HOLDS_NUMBER(&it)) {
+        return bson_iter_as_double(&it);
+    }
+    return 0.0;
+}
+
+static int run_ping(mongo_transport_t *t) {
     bson_t cmd;
     bson_init(&cmd);
     BSON_APPEND_INT32(&cmd, "ping", 1);
 
     bson_t reply;
-    int rc = mongo_run_command(t, "admin", &cmd, &reply, 5000);
+    int rc = mongo_run_command(t, "admin", &cmd, &reply, CMD_TIMEOUT_MS);
     bson_destroy(&cmd);
-
     if (rc != MONGO_WIRE_OK) {
-        error("ping: mongo_run_command rc=%d", rc);
-        return;
+        error("ping: rc=%d", rc);
+        return rc;
+    }
+    info("ping ok=%.0f", reply_ok(&reply));
+    bson_destroy(&reply);
+    return MONGO_WIRE_OK;
+}
+
+static int run_smoke_test(mongo_transport_t *t) {
+    int rc = run_ping(t);
+    if (rc != MONGO_WIRE_OK) {
+        return rc;
     }
 
-    bson_iter_t it;
-    if (bson_iter_init_find(&it, &reply, "ok") && BSON_ITER_HOLDS_NUMBER(&it)) {
-        double ok = bson_iter_as_double(&it);
-        info("ping reply ok=%.1f", ok);
-    } else {
-        warning("ping reply has no 'ok' field");
+    /* Use boot-time milliseconds as a per-iteration tag so back-to-back runs
+     * don't see each other's rows. */
+    int64_t tag = (int64_t)to_ms_since_boot(get_absolute_time());
+
+    /* --- insert --- */
+    bson_t doc;
+    bson_init(&doc);
+    BSON_APPEND_INT64(&doc, "pico_tag", tag);
+    BSON_APPEND_UTF8(&doc, "board", "pico2w");
+
+    bson_t reply;
+    rc = mongo_insert_one(t, TEST_DB, TEST_COLL, &doc, &reply, CMD_TIMEOUT_MS);
+    bson_destroy(&doc);
+    if (rc != MONGO_WIRE_OK || reply_ok(&reply) < 1.0) {
+        error("insert: rc=%d ok=%.0f", rc, reply_ok(&reply));
+        bson_destroy(&reply);
+        return rc != MONGO_WIRE_OK ? rc : MONGO_WIRE_ERR_PROTOCOL;
     }
     bson_destroy(&reply);
+    info("insert ok tag=%lld", (long long)tag);
+
+    /* --- find with cursor --- */
+    bson_t filter;
+    bson_init(&filter);
+    BSON_APPEND_UTF8(&filter, "board", "pico2w");
+
+    mongo_cursor_t *cur = NULL;
+    rc = mongo_find(t, TEST_DB, TEST_COLL, &filter, 5, &cur, CMD_TIMEOUT_MS);
+    bson_destroy(&filter);
+    if (rc != MONGO_WIRE_OK) {
+        error("find: rc=%d", rc);
+        return rc;
+    }
+
+    const bson_t *fd = NULL;
+    int n;
+    while ((n = mongo_cursor_next(cur, &fd, CMD_TIMEOUT_MS)) == 1) {
+        bson_iter_t it;
+        if (bson_iter_init_find(&it, fd, "pico_tag") && BSON_ITER_HOLDS_INT64(&it)) {
+            debug("  doc pico_tag=%lld", (long long)bson_iter_int64(&it));
+        }
+    }
+    info("find iterated %u docs", (unsigned)mongo_cursor_total_seen(cur));
+    int cursor_status = n; /* 0 = exhausted, negative = error */
+    mongo_cursor_destroy(cur);
+    if (cursor_status < 0) {
+        error("cursor: rc=%d", cursor_status);
+        return cursor_status;
+    }
+
+    /* --- update --- */
+    bson_t up_filter;
+    bson_init(&up_filter);
+    BSON_APPEND_INT64(&up_filter, "pico_tag", tag);
+
+    bson_t up_spec;
+    bson_init(&up_spec);
+    bson_t set;
+    BSON_APPEND_DOCUMENT_BEGIN(&up_spec, "$set", &set);
+    BSON_APPEND_BOOL(&set, "seen", true);
+    bson_append_document_end(&up_spec, &set);
+
+    rc = mongo_update_one(t, TEST_DB, TEST_COLL, &up_filter, &up_spec, false, &reply, CMD_TIMEOUT_MS);
+    bson_destroy(&up_filter);
+    bson_destroy(&up_spec);
+    if (rc != MONGO_WIRE_OK || reply_ok(&reply) < 1.0) {
+        error("update: rc=%d ok=%.0f", rc, reply_ok(&reply));
+        bson_destroy(&reply);
+        return rc != MONGO_WIRE_OK ? rc : MONGO_WIRE_ERR_PROTOCOL;
+    }
+    bson_destroy(&reply);
+    info("update ok");
+
+    /* --- delete (cleanup) --- */
+    bson_t del_filter;
+    bson_init(&del_filter);
+    BSON_APPEND_INT64(&del_filter, "pico_tag", tag);
+
+    rc = mongo_delete_one(t, TEST_DB, TEST_COLL, &del_filter, &reply, CMD_TIMEOUT_MS);
+    bson_destroy(&del_filter);
+    if (rc != MONGO_WIRE_OK || reply_ok(&reply) < 1.0) {
+        error("delete: rc=%d ok=%.0f", rc, reply_ok(&reply));
+        bson_destroy(&reply);
+        return rc != MONGO_WIRE_OK ? rc : MONGO_WIRE_ERR_PROTOCOL;
+    }
+    bson_destroy(&reply);
+    info("delete ok");
+
+    return MONGO_WIRE_OK;
 }
 
 static void network_task(void *arg) {
@@ -154,8 +261,13 @@ static void network_task(void *arg) {
             vTaskDelay(pdMS_TO_TICKS(5000));
             continue;
         }
-        info("connected, sending ping");
-        run_ping(t);
+        info("connected, running smoke test");
+        rc = run_smoke_test(t);
+        if (rc == MONGO_WIRE_OK) {
+            info("smoke test passed");
+        } else {
+            warning("smoke test failed rc=%d", rc);
+        }
         mongo_transport_close(t);
         info("closed; sleeping 10s");
         vTaskDelay(pdMS_TO_TICKS(10000));
@@ -168,8 +280,6 @@ int main(void) {
     /* Give USB-CDC a moment to enumerate before any output. */
     sleep_ms(2000);
 
-    /* Stand the logger up before anything else so all subsequent code can
-     * use info()/debug()/error() without thinking about it. */
     logger_init();
     info("=== micro-mongodb boot ===");
 
