@@ -38,6 +38,41 @@
  * we do every TLS handshake. */
 #define MBEDTLS_HAVE_ASM
 
+/* TODO: route SHA-256 through RP2350's hardware accelerator.
+ *
+ * The natural way is `#define MBEDTLS_SHA256_ALT` and lean on pico-sdk's
+ * `pico_mbedtls` shim (src/rp2_common/pico_mbedtls/pico_mbedtls.c). That
+ * shim implements init/free/starts/update/finish around `pico_sha256_*`
+ * but skips `mbedtls_sha256_clone`. mbedTLS's TLS 1.2 code path calls
+ * clone in three places (Finished MAC + handshake-hash extraction in
+ * ssl_tls.c, plus a MAC computation in ssl_msg.c), so enabling the alt
+ * define link-fails on `undefined reference to mbedtls_sha256_clone`.
+ *
+ * Good news: every TLS call site follows the `clone -> finish -> free`
+ * pattern -- the cloned context is never updated again. So we don't
+ * need a general-purpose clone; we just need clone-then-finish to work.
+ *
+ * The hardware exposes:
+ *   - sum[0..7]  : read-only intermediate state (after each full block)
+ *   - wdata      : write-only data port
+ *   - no IV-load : no way to push an intermediate state back into hw
+ *
+ * That's enough. The plan:
+ *   1. Extend the alt context with a 64-byte software-shadow buffer of
+ *      the current partial block (mirroring what's been streamed to hw).
+ *   2. Replace pico_mbedtls's alt shim with a richer one in umongoc/:
+ *      same external API, but the context carries the shadow buffer +
+ *      the byte counter + an is_hw_active flag.
+ *   3. clone(): wait for hw_ready, snapshot sum[0..7] into the dst's
+ *      state[8], copy the partial-block shadow + byte counter, mark
+ *      dst hw_inactive.
+ *   4. finish() on a hw-inactive ctx: small software SHA-256 finalize
+ *      (one or two compressions of the padded final block) starting
+ *      from the snapshotted state. ~50 LOC.
+ *
+ * ~150-200 LOC total + tests. Doable in a follow-up session; the
+ * headline speedup on TLS would be a couple hundred ms on Pico 2 W. */
+
 /* Make X.509 chain validation actually check the certificate's notBefore /
  * notAfter dates. Without MBEDTLS_HAVE_TIME_DATE the chain validator skips
  * date checks entirely, so an attacker can re-use an expired-but-otherwise-
