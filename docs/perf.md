@@ -6,9 +6,15 @@ seconds, dominated by TLS handshake and SCRAM PBKDF2 — both pure
 software crypto. The Pico 2 W (Cortex-M33 @ 150 MHz) comes in about
 **1.2× faster on TLS and 1.9× faster on SCRAM** — real improvement
 but more modest than the back-of-envelope 3-4× we initially projected.
-RP2350 has hardware AES but no SHA-256 or P-256 ECC accelerator, so
-the speedup is mostly clock bump + better cycle counts on multiply-
-heavy bignum ops, not crypto offload.
+
+The numbers below are with mbedTLS doing all crypto in software on
+both boards. RP2350 actually has a hardware **SHA-256 accelerator**
+(see `pico/sha256.h`); we aren't wired into it yet. RP2350 does *not*
+have hardware AES or P-256 ECC, so the remaining handshake cost
+(ECDHE + ECDSA + AES-GCM record encryption) is unavoidable in
+software. A future task to plumb `MBEDTLS_SHA256_ALT` through to
+`pico_sha256_*` would compress the TLS PRF / Finished / cert-sig-hash
+slice further on the M33.
 
 ## Pico W baseline (RP2040, M0+ @ 133 MHz)
 
@@ -92,24 +98,27 @@ projected when we wrote this page from first principles.
 The original projection assumed M33 would close the gap on SHA-256 and
 P-256 ECC the way it does on general multiply-heavy code. In practice:
 
-- **No hardware SHA-256 on RP2350.** mbedTLS's software SHA-256 path
-  is what runs on both boards. M33's wider data path gives some win;
-  there's no order-of-magnitude offload.
+- **Hardware SHA-256 is present but not used.** RP2350 has a dedicated
+  SHA-256 accelerator that mbedTLS doesn't know about; software SHA-256
+  is what runs today. Wiring `MBEDTLS_SHA256_ALT` through to
+  `pico_sha256_*` is an open optimization.
 - **No hardware P-256 ECC on RP2350.** ECDHE and ECDSA verify both
   reduce to modular exponentiation in software. The M33 hardware
   multiplier helps the inner bignum ops, but the overall path is
   still bound by the same algorithm with the same iteration counts.
-- **Hardware AES is present** on RP2350 but TLS record encryption
-  is a small fraction of handshake cost; it doesn't move the headline.
+- **No hardware AES on RP2350.** TLS-record symmetric crypto is a
+  small fraction of handshake cost (most of the work is the asymmetric
+  side), so this doesn't dominate, but it's also software.
 - **Clock bump:** 150 MHz / 133 MHz = 1.13×. That, combined with M33's
   ~2× better cycle counts on multiply-heavy bignum, is essentially
   the entire speedup we measured.
 
 The demo still lands — there's a visible, repeatable speedup — but the
 honest framing is "M33 is ~2× faster on auth crypto," not "M33 closes
-the gap to hardware-accelerated TLS." A future optimization that wires
-mbedTLS into RP2350's optional crypto-coprocessor support would
-matter more than the M0+/M33 swap by itself.
+the gap to hardware-accelerated TLS." Wiring `MBEDTLS_SHA256_ALT` to
+the RP2350 hardware unit is the most leveraged next step; it would
+help every SHA-256-touching path (TLS PRF, TLS Finished, cert-sig
+hash, HMAC-SHA-256, SCRAM-SHA-256 PBKDF2).
 
 ### Caveats
 
