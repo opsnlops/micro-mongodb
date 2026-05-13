@@ -3,9 +3,12 @@
 Measured numbers against MongoDB Atlas free tier. The headline: on a
 Pico W (Cortex-M0+ @ 133 MHz), bring-up to first-CRUD takes ~3-4
 seconds, dominated by TLS handshake and SCRAM PBKDF2 — both pure
-software crypto. The Pico 2 W (Cortex-M33 @ 150 MHz with a hardware
-multiplier and better cycle counts on SHA-256 and modular exp) is
-expected to be 3-4× faster on those paths.
+software crypto. The Pico 2 W (Cortex-M33 @ 150 MHz) comes in about
+**1.2× faster on TLS and 1.9× faster on SCRAM** — real improvement
+but more modest than the back-of-envelope 3-4× we initially projected.
+RP2350 has hardware AES but no SHA-256 or P-256 ECC accelerator, so
+the speedup is mostly clock bump + better cycle counts on multiply-
+heavy bignum ops, not crypto offload.
 
 ## Pico W baseline (RP2040, M0+ @ 133 MHz)
 
@@ -50,25 +53,74 @@ First insert         [▎]                                 0.1 s
 After cold start, the per-cycle cost drops to roughly 200 ms because
 WiFi/SNTP/TLS/SCRAM are amortized.
 
-## Pico 2 W projected (RP2350, M33 @ 150 MHz)
+### Where the time goes (Pico 2 W cold start)
 
-Same firmware, just `cmake -DPICO_BOARD=pico2_w ..`. Expectations
-based on M33's 1.5× higher clock and significantly better cycle counts
-for SHA-256 / ECC / AES (the M33 has a single-cycle hardware multiplier
-where the M0+ uses a multi-cycle iterative one):
+Same shape, crypto slice is the only thing that moves:
 
-| Operation | Pico W | Pico 2 W (expected) | Speedup |
+```
+WiFi assoc + DHCP    [████████████████████]              11 s
+SNTP                 [██]                                 3 s
+DNS SRV+TXT          [▍]                                 0.2 s
+TLS handshake        [████]                              2.1 s
+hello                [▎]                                 0.1 s
+SCRAM-SHA-1          [█]                                 0.6 s
+First insert         [▎]                                 0.1 s
+                     └─────────────────────────────── 17 s total
+```
+
+WiFi/SNTP are CYW43439-bound, not CPU-bound, so the wins there
+(when present) are pure variance. The crypto wins are real.
+
+## Pico 2 W measured (RP2350, M33 @ 150 MHz)
+
+Same firmware, just `cmake -DPICO_BOARD=pico2_w ..`. Measured against
+the same Atlas free-tier cluster on 2026-05-13:
+
+| Operation | Pico W | Pico 2 W | Speedup |
 |---|---|---|---|
-| TLS handshake | ~2.5 s | ~600-800 ms | 3-4× |
-| SCRAM PBKDF2 (SHA-1, 10000 iter) | ~1.10 s | ~250-400 ms | 3-4× |
-| Connect-to-ready | ~3.7 s | ~1 s | ~4× |
+| TLS handshake + hello | ~2.5 s | **~2.1 s** | 1.2× |
+| SCRAM-SHA-1 (PBKDF2 10000 iter) | ~1.10 s | **~590 ms** | 1.9× |
+| Connect-to-ready (single handshake) | ~3.7 s | ~2.7 s | ~1.4× |
 | CRUD ops (network-bound) | unchanged | unchanged | ~1× |
 
 CRUD operations are dominated by network round-trip time, so they
-won't change much. The dramatic delta is on the crypto path.
+don't change. The crypto path does speed up — but less than we
+projected when we wrote this page from first principles.
 
-To actually measure on a 2 W: flash, capture a few `perf [pico2_w]: ...`
-lines and the SCRAM/TLS timings, compare against this baseline.
+### Why the speedup is smaller than projected
+
+The original projection assumed M33 would close the gap on SHA-256 and
+P-256 ECC the way it does on general multiply-heavy code. In practice:
+
+- **No hardware SHA-256 on RP2350.** mbedTLS's software SHA-256 path
+  is what runs on both boards. M33's wider data path gives some win;
+  there's no order-of-magnitude offload.
+- **No hardware P-256 ECC on RP2350.** ECDHE and ECDSA verify both
+  reduce to modular exponentiation in software. The M33 hardware
+  multiplier helps the inner bignum ops, but the overall path is
+  still bound by the same algorithm with the same iteration counts.
+- **Hardware AES is present** on RP2350 but TLS record encryption
+  is a small fraction of handshake cost; it doesn't move the headline.
+- **Clock bump:** 150 MHz / 133 MHz = 1.13×. That, combined with M33's
+  ~2× better cycle counts on multiply-heavy bignum, is essentially
+  the entire speedup we measured.
+
+The demo still lands — there's a visible, repeatable speedup — but the
+honest framing is "M33 is ~2× faster on auth crypto," not "M33 closes
+the gap to hardware-accelerated TLS." A future optimization that wires
+mbedTLS into RP2350's optional crypto-coprocessor support would
+matter more than the M0+/M33 swap by itself.
+
+### Caveats
+
+- Times vary 10-20% across runs depending on which Atlas shard answers
+  the connection and on network jitter.
+- The "connect-to-ready" headline assumes a single TLS handshake. When
+  the SRV cycle lands on a secondary first and the driver redirects
+  to the primary, you pay the TLS+hello cost twice (~4.8 s end-to-end
+  in the test run on 2026-05-13). Caching the last-known primary
+  (which the client does on reconnect) skips the second handshake on
+  steady-state cycles.
 
 ## Where SRAM goes
 
