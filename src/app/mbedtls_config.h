@@ -30,6 +30,14 @@
 #define MBEDTLS_ALLOW_PRIVATE_ACCESS
 #define MBEDTLS_HAVE_TIME
 
+/* Enable mbedTLS's hand-tuned inline assembly paths for bignum multiply
+ * (see bn_mul.h). Without this, ECDHE / ECDSA / RSA all fall back to a
+ * generic C MULADDC loop. The ARM-specific path uses Thumb-2 instructions
+ * (notably UMAAL on M33; M0+ uses a different but still hand-tuned ASM
+ * stanza) that materially beat the C version on the 256-bit bignum ops
+ * we do every TLS handshake. */
+#define MBEDTLS_HAVE_ASM
+
 /* Make X.509 chain validation actually check the certificate's notBefore /
  * notAfter dates. Without MBEDTLS_HAVE_TIME_DATE the chain validator skips
  * date checks entirely, so an attacker can re-use an expired-but-otherwise-
